@@ -313,6 +313,15 @@ def _step(logdensity, max_depth, chain, lane):
     return _begin_next(chain, lane, ended, sub_done), record, lane.active & ended
 
 
+def _write_records(state, records, done):
+    buffer_size = state.records.job.shape[0]
+    row = state.num_records + jnp.cumsum(done, dtype=jnp.int32) - 1
+    row = jnp.where(done, row, buffer_size)  # out of range: not written
+    return jax.tree.map(
+        lambda buffer, new: buffer.at[row].set(new, mode="drop"), state.records, records
+    )
+
+
 def _iteration(logdensity, max_depth, chains: Chain, num_draws, state: State) -> State:
     """One gradient evaluation in every lane; collect the transitions that finished."""
     count = partial(jnp.sum, dtype=jnp.int32)
@@ -320,13 +329,8 @@ def _iteration(logdensity, max_depth, chains: Chain, num_draws, state: State) ->
     lanes, records, done = jax.vmap(partial(_step, logdensity, max_depth))(
         chains, state.lanes
     )
-    buffer_size = state.records.job.shape[0]
-    row = state.num_records + jnp.cumsum(done, dtype=jnp.int32) - 1
-    row = jnp.where(done, row, buffer_size)  # out of range: not written
-    records = jax.tree.map(
-        lambda buffer, new: buffer.at[row].set(new, mode="drop"), state.records, records
-    )
-    finished = done & (lanes.draw == num_draws)
+    records = _write_records(state, records, done)
+    finished = jnp.bool_(False) if num_draws is None else done & (lanes.draw == num_draws)
     return State(
         lanes=lanes._replace(active=lanes.active & ~finished),
         records=records,
@@ -336,7 +340,10 @@ def _iteration(logdensity, max_depth, chains: Chain, num_draws, state: State) ->
     )
 
 
-def _loop(logdensity, max_depth, state: State, chains: Chain, num_draws, chains_waiting):
+def _loop(
+    logdensity, max_depth, state: State, chains: Chain, num_draws, chains_waiting,
+    max_rounds=None, first_draw=False,
+):
     """Iterate until the host has something to do.
 
     That is: all chains are done, or a lane is idle while chains are waiting, or the
@@ -350,7 +357,9 @@ def _loop(logdensity, max_depth, state: State, chains: Chain, num_draws, chains_
     def go_on(state):
         active = state.lanes.active
         room = state.num_records + num_lanes <= buffer_size
-        return room & jnp.any(active) & ~(chains_waiting & jnp.any(~active))
+        budget = True if max_rounds is None else state.num_iterations < max_rounds
+        emit = ~jnp.asarray(first_draw) | (state.num_records == 0)
+        return emit & budget & room & jnp.any(active) & ~(chains_waiting & jnp.any(~active))
 
     iteration = partial(_iteration, logdensity, max_depth, chains, num_draws)
     return jax.lax.while_loop(go_on, iteration, state)

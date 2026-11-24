@@ -243,6 +243,9 @@ def _warm_step(
     chain,
     lane,
     stats,
+    *,
+    stream=False,
+    sampling_key=None,
 ):
     chain = chain._replace(step_size=stats.step, inverse_mass=stats.metric)
     lane, rec, ended, sub_done, leaf, prob, delta, take_leaf, take_tree = _advance(
@@ -356,6 +359,23 @@ def _warm_step(
         stats.transitions.at[phase].add(ended.astype(jnp.int32)),
         stats.divergences.at[phase].add((ended & rec.is_divergent).astype(jnp.int32)),
     )
+    if stream:
+        warming = lane.active & (stats.phase < budgets.size)
+        ready = warming & boundary & final
+        keep = lane.active & ~warming & ended
+        next_stats = _where(warming, next_stats, stats)
+        updated = chain._replace(
+            key=jnp.where(ready, sampling_key, chain.key),
+            step_size=next_stats.step,
+            inverse_mass=next_stats.metric,
+        )
+        # _advance has already kept the accepted position and its gradient. Start
+        # sampling transition zero with the same independent key as warmup().jobs.
+        lane = lane._replace(
+            draw=jnp.where(ready, 0, lane.draw), active=lane.active & ~failed
+        )
+        lane = _begin_next(updated, lane, ended, sub_done)
+        return updated, lane, next_stats, rec, keep
     updated = chain._replace(step_size=next_stats.step, inverse_mass=metric)
     lane = _begin_next(updated, lane, ended, sub_done)
     return lane._replace(active=lane.active & ~(boundary & final) & ~failed), next_stats
@@ -429,33 +449,10 @@ def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restar
     return jax.jit(refill), jax.jit(run)
 
 
-def warmup(
-    logdensity,
-    jobs: Jobs,
-    *,
-    window_evaluations=None,
-    diagonal=None,
-    schedule=None,
-    acceptance="mean",
-    restart_dual=True,
-    target_acceptance=0.8,
-    data=None,
-    num_lanes=None,
-    max_depth=10,
-) -> WarmupResult:
-    """Learn one diagonal inverse mass and step size for each chain.
-
-    Choose the diagonal estimator with `diagonal` and the stopping rule with a
-    `FixedWindows` or `AdaptiveWindows` schedule. As shorthand, `window_evaluations`
-    gives fixed per-chain gradient budgets, including the final step-size-only window.
-    The default budgets are (1000, 2000, 1000). A chain always completes its trajectory.
-
-    `acceptance` selects mean tree acceptance, symmetric acceptance, or symmetric
-    acceptance only in the final window. `restart_dual` restarts dual averaging at
-    metric-window boundaries. Sampling receives frozen parameters and independent keys.
-    Per-window counts exclude initialization. Adaptive schedules leave unused metric
-    windows at zero and store final calibration counts in the last column.
-    """
+def _prepare_warmup(
+    logdensity, jobs, window_evaluations, diagonal, schedule, acceptance,
+    restart_dual, target_acceptance, data, num_lanes, max_depth,
+):
     if diagonal is None:
         diagonal = DiagonalAdaptation()
     if not isinstance(diagonal, DiagonalAdaptation):
@@ -515,6 +512,41 @@ def warmup(
             )
     if not np.all(np.isfinite(queue.position)):
         raise ValueError("Starting positions must be finite.")
+    return logdensity, queue, width, budgets, diagonal, schedule, max_depth
+
+
+def warmup(
+    logdensity,
+    jobs: Jobs,
+    *,
+    window_evaluations=None,
+    diagonal=None,
+    schedule=None,
+    acceptance="mean",
+    restart_dual=True,
+    target_acceptance=0.8,
+    data=None,
+    num_lanes=None,
+    max_depth=10,
+) -> WarmupResult:
+    """Learn one diagonal inverse mass and step size for each chain.
+
+    Choose the diagonal estimator with `diagonal` and the stopping rule with a
+    `FixedWindows` or `AdaptiveWindows` schedule. As shorthand, `window_evaluations`
+    gives fixed per-chain gradient budgets, including the final step-size-only window.
+    The default budgets are (1000, 2000, 1000). A chain always completes its trajectory.
+
+    `acceptance` selects mean tree acceptance, symmetric acceptance, or symmetric
+    acceptance only in the final window. `restart_dual` restarts dual averaging at
+    metric-window boundaries. Sampling receives frozen parameters and independent keys.
+    Per-window counts exclude initialization. Adaptive schedules leave unused metric
+    windows at zero and store final calibration counts in the last column.
+    """
+    logdensity, queue, width, budgets, diagonal, schedule, max_depth = _prepare_warmup(
+        logdensity, jobs, window_evaluations, diagonal, schedule, acceptance, restart_dual,
+        target_acceptance, data, num_lanes, max_depth,
+    )
+    n_jobs, dim = queue.position.shape
     dtype = queue.position.dtype
     n_windows = len(budgets)
     lanes, chains = _empty_lanes(width, dim, dtype, max_depth, data)

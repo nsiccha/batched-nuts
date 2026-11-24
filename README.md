@@ -296,6 +296,36 @@ The sampling loop is in `src/batched_nuts/nuts.py`. The per-lane adaptation is i
   NUTS in general: a compiler transformation that tracks a program point for every
   member of a batch. This package does it by hand for one algorithm.
 
+## Pooled draws during a run
+
+Use `sample_batches` to keep every chain sampling until a common deadline or
+gradient budget. Each job occupies one lane. With a warmup schedule, a chain can
+emit samples as soon as its own metric and step size freeze. With fitted jobs,
+omit the schedule. The first completed draw is returned immediately and subsequent
+draws are transferred to host memory in bounded batches.
+
+```python
+from batched_nuts import AdaptiveWindows, sample_batches
+
+for batch in sample_batches(logdensity, jobs, schedule=AdaptiveWindows(),
+                            buffer_size=1024, max_rounds=50_000):
+    q = batch.records.position
+    chain = batch.records.job
+    completed_at = batch.completion_rounds
+    # Consume q here. Keeping a running sum and count uses fixed host memory.
+```
+
+`max_rounds` counts parallel leapfrog rounds from the start of warmup. The one
+batched evaluation of the starting positions precedes round one. Omit the
+limit to consume the iterator for as long as needed. `rounds_per_batch` can
+bound the intervals between yields, including empty warmup checkpoints.
+`buffer_size` must accommodate one simultaneous draw from every lane.
+Device storage scales with lane count, parameter dimension, tree-depth limit
+and buffer capacity, independently of how long the iterator runs.
+If adaptive warmup exhausts its windows for a chain, the batch reports its ID
+in `failed_jobs` once. The remaining chains continue sampling. If every chain
+exhausts its windows, the stream ends after the last failure report.
+
 ## License
 
 MIT
