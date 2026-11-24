@@ -192,12 +192,8 @@ def _begin_doubling(lane: Lane) -> Lane:
     )
 
 
-def _step(logdensity, max_depth, chain: Chain, lane: Lane):
-    """Advance one lane by one gradient evaluation.
-
-    Returns the lane, the record of its transition and whether that transition has just
-    finished (the record is meaningless otherwise).
-    """
+def _advance(logdensity, max_depth, chain: Chain, lane: Lane):
+    """Take a leapfrog step, exposing the two proposal probabilities for warmup."""
     inverse_mass = chain.inverse_mass
 
     # One leapfrog step from the end of the trajectory that the current subtree extends.
@@ -221,9 +217,9 @@ def _step(logdensity, max_depth, chain: Chain, lane: Lane):
     # weight / (weight of all states of the subtree so far).
     first = lane.leaf == 0
     old = lane.sub
+    leaf_probability = jax.scipy.special.expit(leaf.weight - old.weight)
     accept = first | jax.random.bernoulli(
-        jax.random.fold_in(lane.leaf_keys, lane.leaf),
-        jax.scipy.special.expit(leaf.weight - old.weight),
+        jax.random.fold_in(lane.leaf_keys, lane.leaf), leaf_probability
     )
     sub = _where(accept, leaf, old)._replace(
         weight=jnp.where(first, leaf.weight, jnp.logaddexp(old.weight, leaf.weight)),
@@ -259,9 +255,8 @@ def _step(logdensity, max_depth, chain: Chain, lane: Lane):
     # (biased progressive sampling); one that stopped early is not sampled from.
     top = lane.proposal
     complete = ~(sub_turning | diverging)
-    take = complete & jax.random.bernoulli(
-        lane.accept_key, jnp.clip(jnp.exp(sub.weight - top.weight), max=1)
-    )
+    subtree_probability = jnp.clip(jnp.exp(sub.weight - top.weight), max=1)
+    take = complete & jax.random.bernoulli(lane.accept_key, subtree_probability)
     merged = _where(take, sub, top)._replace(
         weight=jnp.where(complete, jnp.logaddexp(top.weight, sub.weight), top.weight),
         sum_log_accept=jnp.logaddexp(top.sum_log_accept, sub.sum_log_accept),
@@ -300,10 +295,21 @@ def _step(logdensity, max_depth, chain: Chain, lane: Lane):
         checkpoint_momentum=checkpoint_momentum,
         checkpoint_sum=checkpoint_sum,
     )
-    # What ends here begins anew: the next transition, and the next subtree.
+    probabilities = (
+        jnp.where(first, 1.0, leaf_probability),
+        jnp.where(sub_done & complete, subtree_probability, 0.0),
+    )
+    return lane, record, ended, sub_done, end, probabilities
+
+
+def _begin_next(chain, lane, ended, sub_done):
     lane = _where(ended, _begin_transition(chain, lane), lane)
-    lane = _where(sub_done, _begin_doubling(lane), lane)
-    return lane, record, done
+    return _where(sub_done, _begin_doubling(lane), lane)
+
+
+def _step(logdensity, max_depth, chain, lane):
+    lane, record, ended, sub_done, _, _ = _advance(logdensity, max_depth, chain, lane)
+    return _begin_next(chain, lane, ended, sub_done), record, lane.active & ended
 
 
 def _iteration(logdensity, max_depth, chains: Chain, num_draws, state: State) -> State:
@@ -349,7 +355,7 @@ def _loop(logdensity, max_depth, state: State, chains: Chain, num_draws, chains_
     return jax.lax.while_loop(go_on, iteration, state)
 
 
-def _refill(logdensity, state: State, chains: Chain, take, job, jobs: Jobs, data):
+def _assign(logdensity, lanes: Lane, chains: Chain, take, job, jobs: Jobs, data):
     """Hand the chains in the rows of `jobs` to the lanes marked in `take`.
 
     `take`, `job` and `jobs` have one row per lane; the rows of lanes that take nothing
@@ -370,7 +376,6 @@ def _refill(logdensity, state: State, chains: Chain, take, job, jobs: Jobs, data
         ),
     )
     logp, grad = jax.vmap(jax.value_and_grad(logdensity))(jobs.position, chains.data)
-    lanes = state.lanes
     taken = lanes._replace(
         active=jnp.ones_like(lanes.active),
         draw=jnp.zeros_like(lanes.draw),
@@ -381,7 +386,12 @@ def _refill(logdensity, state: State, chains: Chain, take, job, jobs: Jobs, data
     taken = jax.vmap(lambda chain, lane: _begin_doubling(_begin_transition(chain, lane)))(
         chains, taken
     )
-    return state._replace(lanes=jax.vmap(_where)(take, taken, lanes)), chains
+    return jax.vmap(_where)(take, taken, lanes), chains
+
+
+def _refill(logdensity, state, chains, take, job, jobs, data):
+    lanes, chains = _assign(logdensity, state.lanes, chains, take, job, jobs, data)
+    return state._replace(lanes=lanes), chains
 
 
 @lru_cache(maxsize=16)
@@ -391,8 +401,8 @@ def _compiled(logdensity: Callable, max_depth: int):
     return refill, loop
 
 
-def _empty(num_lanes, dim, dtype, max_depth, buffer_size, data) -> tuple[State, Chain]:
-    """Lanes without chains and an empty record buffer."""
+def _empty_lanes(num_lanes, dim, dtype, max_depth, data):
+    """Lanes without chains."""
     scalar, vector = jnp.zeros((), dtype), jnp.zeros(dim, dtype)
     table = jnp.zeros((max_depth, dim), dtype)
     index = jnp.int32(0)
@@ -419,20 +429,63 @@ def _empty(num_lanes, dim, dtype, max_depth, buffer_size, data) -> tuple[State, 
         checkpoint_momentum=table,
         checkpoint_sum=table,
     )
-    record = Record(index, index, vector, scalar, index, False, False, scalar)
     chain = Chain(index, key, scalar, vector, jax.tree.map(lambda x: x[0], data))
 
-    def repeat(tree, n):  # a separate array for every field: each is donated on its own
-        return jax.tree.map(lambda x: jnp.broadcast_to(x, (n,) + jnp.shape(x)), tree)
+    return _repeat(lane, num_lanes), _repeat(chain, num_lanes)
 
+
+def _repeat(tree, n):
+    # A separate array for every field, so each can be donated on its own.
+    return jax.tree.map(lambda x: jnp.broadcast_to(x, (n,) + jnp.shape(x)), tree)
+
+
+def _empty(num_lanes, dim, dtype, max_depth, buffer_size, data):
+    lanes, chains = _empty_lanes(num_lanes, dim, dtype, max_depth, data)
+    index = jnp.int32(0)
+    scalar, vector = jnp.zeros((), dtype), jnp.zeros(dim, dtype)
+    record = Record(index, index, vector, scalar, index, False, False, scalar)
     state = State(
-        lanes=repeat(lane, num_lanes),
-        records=repeat(record, buffer_size),
+        lanes=lanes,
+        records=_repeat(record, buffer_size),
         num_records=jnp.zeros((), jnp.int32),
         num_iterations=jnp.zeros((), jnp.int32),
         num_evaluations=jnp.zeros((), jnp.int32),
     )
-    return state, repeat(chain, num_lanes)
+    return state, chains
+
+
+def _prepare_queue(logdensity, jobs, data):
+    position = np.asarray(jobs.position)
+    if not np.issubdtype(position.dtype, np.floating):
+        raise TypeError("`jobs.position` must be a floating point array.")
+    dtype = position.dtype
+    num_jobs = len(position)
+    if data is None:
+        logdensity = _without_data(logdensity)
+        dataset = np.zeros(num_jobs, np.int32)
+    elif jobs.dataset is None:
+        raise ValueError("`jobs.dataset` must say which slice of `data` each chain reads.")
+    else:
+        dataset = np.asarray(jobs.dataset, np.int32)
+    # The queue stays in host memory; the device only ever sees the chains in the lanes.
+    queue = Jobs(
+        key=np.asarray(jax.random.key_data(jobs.key)),
+        position=position,
+        step_size=np.asarray(jobs.step_size, dtype),
+        inverse_mass=np.asarray(jobs.inverse_mass, dtype),
+        dataset=dataset,
+    )
+    return logdensity, queue
+
+
+def _assignment(active, queue, next_job):
+    idle = np.flatnonzero(~np.asarray(active))[: len(queue.position) - next_job]
+    if not len(idle):
+        return None
+    take = np.zeros(len(active), bool)
+    job = np.zeros(len(active), np.int32)
+    take[idle], job[idle] = True, np.arange(next_job, next_job + len(idle))
+    return take, job, Jobs(*(x[job] for x in queue)), next_job + len(idle)
 
 
 def sample(
@@ -472,26 +525,9 @@ def sample(
         host memory.  The draws are returned as NumPy arrays and never accumulate on the
         device.  The default is `max(1024, 4 * num_lanes)`.
     """
-    position = np.asarray(jobs.position)
-    if not np.issubdtype(position.dtype, np.floating):
-        raise TypeError("`jobs.position` must be a floating point array.")
-    dtype = position.dtype
-    num_jobs, dim = position.shape
-    if data is None:
-        logdensity = _without_data(logdensity)
-        dataset = np.zeros(num_jobs, np.int32)
-    elif jobs.dataset is None:
-        raise ValueError("`jobs.dataset` must say which slice of `data` each chain reads.")
-    else:
-        dataset = np.asarray(jobs.dataset, np.int32)
-    # The queue stays in host memory; the device only ever sees the chains in the lanes.
-    queue = Jobs(
-        key=np.asarray(jax.random.key_data(jobs.key)),
-        position=position,
-        step_size=np.asarray(jobs.step_size, dtype),
-        inverse_mass=np.asarray(jobs.inverse_mass, dtype),
-        dataset=dataset,
-    )
+    logdensity, queue = _prepare_queue(logdensity, jobs, data)
+    num_jobs, dim = queue.position.shape
+    dtype = queue.position.dtype
     num_lanes = num_jobs if num_lanes is None else min(num_lanes, num_jobs)
     buffer_size = max(1024, 4 * num_lanes) if buffer_size is None else buffer_size
     buffer_size = max(buffer_size, num_lanes)
@@ -520,14 +556,10 @@ def sample(
     state, chains = _empty(num_lanes, dim, dtype, max_depth, buffer_size, data)
     next_job = num_iterations = num_evaluations = 0
     while True:
-        idle = np.flatnonzero(~np.asarray(state.lanes.active))[: num_jobs - next_job]
-        if len(idle):  # the next chains of the queue go to the idle lanes
-            take = np.zeros(num_lanes, bool)
-            job = np.zeros(num_lanes, np.int32)
-            take[idle], job[idle] = True, np.arange(next_job, next_job + len(idle))
-            rows = Jobs(*(x[job] for x in queue))
+        assignment = _assignment(state.lanes.active, queue, next_job)
+        if assignment is not None:
+            take, job, rows, next_job = assignment
             state, chains = refill(state, chains, take, job, rows, data)
-            next_job += len(idle)
         state = loop(state, chains, jnp.int32(num_draws), next_job < num_jobs)
         num_iterations += int(state.num_iterations)
         num_evaluations += int(state.num_evaluations)

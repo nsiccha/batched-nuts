@@ -104,11 +104,41 @@ counts the gradient evaluations that advanced a chain.
 A log density without data takes the position only: `sample(logdensity, jobs, num_draws)`.
 Without `num_lanes`, all chains run at once.
 
+## Optional diagonal warmup
+
+Give each chain an initial step size and positive diagonal inverse mass in `jobs`.
+Warmup returns the last positions, frozen parameters and fresh sampling keys together
+as `fit.jobs`:
+
+```python
+fit = batched_nuts.warmup(logdensity, jobs, data=data, num_lanes=32)
+draws = batched_nuts.sample(logdensity, fit.jobs, num_draws=250, data=data, num_lanes=32)
+print(fit.num_evaluations[0])  # actual leapfrog count in each window of chain 0
+```
+
+Each chain uses its own gradient-evaluation windows. The default
+`window_evaluations=(1000, 2000, 1000)` gives per-window leapfrog budgets.
+A chain finishes the trajectory that crosses its budget before starting the next
+window. `num_evaluations`, `num_transitions` and `num_divergences` report the
+actual counts for each chain and window.
+
+At each leapfrog step the sampler accumulates position and log-density gradient
+moments with the probabilities used to select the NUTS proposal. Each completed
+trajectory contributes one unit of weight to its window, including its within-trajectory
+variance. The diagonal inverse mass estimate is the square root of the ratio of the
+two coordinatewise variances. A short window shrinks the log estimate toward the
+previous diagonal with a weight of three transitions. Each metric window installs its estimate
+before the next momentum draw. The final window tunes only the step size.
+
+Step-size adaptation uses dual averaging on the mean leapfrog acceptance, with
+`target_acceptance=0.8` by default. Each metric refit restarts dual averaging.
+The final smoothed step size and metric stay fixed during sampling.
+
 ## What you provide, and what the package leaves out
 
 - **Step size and mass matrix.** Every chain has a fixed step size and a fixed diagonal
-  inverse mass matrix, given in `Jobs`. There is no warm-up in this package. Take them
-  from any warm-up you like; the benchmark uses `blackjax.window_adaptation`.
+  inverse mass matrix during sampling. Supply them in `Jobs` or use the jobs returned
+  by `warmup`. The benchmark uses `blackjax.window_adaptation` for its common start.
 - **Positions are vectors.** Flatten a structured position yourself, for example with
   `jax.flatten_util.ravel_pytree`.
 - **Keys.** Transition `t` of a chain uses the key `jax.random.fold_in(key, t)` exactly
