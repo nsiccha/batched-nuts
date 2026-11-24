@@ -192,7 +192,7 @@ def _begin_doubling(lane: Lane) -> Lane:
     )
 
 
-def _advance(logdensity, max_depth, chain: Chain, lane: Lane):
+def _advance(logdensity, max_depth, chain: Chain, lane: Lane, *, warmup_info=False):
     """Take a leapfrog step, exposing the two proposal probabilities for warmup."""
     inverse_mass = chain.inverse_mass
 
@@ -299,7 +299,8 @@ def _advance(logdensity, max_depth, chain: Chain, lane: Lane):
         jnp.where(first, 1.0, leaf_probability),
         jnp.where(sub_done & complete, subtree_probability, 0.0),
     )
-    return lane, record, ended, sub_done, end, probabilities
+    result = lane, record, ended, sub_done, end, probabilities
+    return (*result, delta, accept, sub_done & take) if warmup_info else result
 
 
 def _begin_next(chain, lane, ended, sub_done):

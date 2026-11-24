@@ -116,13 +116,13 @@ draws = batched_nuts.sample(logdensity, fit.jobs, num_draws=250, data=data, num_
 print(fit.num_evaluations[0])  # actual leapfrog count in each window of chain 0
 ```
 
-Each chain uses its own gradient-evaluation windows. The default
+With the default settings each chain uses its own gradient-evaluation windows. The default
 `window_evaluations=(1000, 2000, 1000)` gives per-window leapfrog budgets.
 A chain finishes the trajectory that crosses its budget before starting the next
 window. `num_evaluations`, `num_transitions` and `num_divergences` report the
 actual counts for each chain and window.
 
-At each leapfrog step the sampler accumulates position and log-density gradient
+In this configuration the sampler accumulates position and log-density gradient
 moments with the probabilities used to select the NUTS proposal. Each completed
 trajectory contributes one unit of weight to its window, including its within-trajectory
 variance. The diagonal inverse mass estimate is the square root of the ratio of the
@@ -133,6 +133,47 @@ before the next momentum draw. The final window tunes only the step size.
 Step-size adaptation uses dual averaging on the mean leapfrog acceptance, with
 `target_acceptance=0.8` by default. Each metric refit restarts dual averaging.
 The final smoothed step size and metric stay fixed during sampling.
+
+### Choosing how the metric learns
+
+For immediate updates with NUTS weights and a per-chain stopping rule:
+
+```python
+diagonal = batched_nuts.DiagonalAdaptation(
+    evidence="nuts", estimator="position_score", initial="gradient",
+    memory="overlapping", switch_interval=80, switch_clock="transitions",
+    update_interval=1, shrinkage=0,
+)
+schedule = batched_nuts.AdaptiveWindows(
+    first_window=1000, growth=2, clock="gradients", tolerance=2,
+    max_windows=10, final_window=45, final_clock="transitions",
+)
+fit = batched_nuts.warmup(
+    logdensity, jobs, data=data, num_lanes=32, diagonal=diagonal,
+    schedule=schedule, acceptance="late_symmetric", restart_dual=False,
+)
+```
+
+| Choice | What it controls |
+| --- | --- |
+| `evidence` | `"selected"` uses one draw per transition, including repeats. `"eligible_selected"` skips the starting point and, on a divergent transition, requires a draw more than four steps from the start. `"nuts"` gives each trajectory unit weight and integrates over its proposal probabilities. `"eligible_leaves"` gives each finite noninitial leapfrog point unit weight when its energy increase is below `log(100)`, including leaves of discarded subtrees. |
+| `estimator` | `"position"` fits coordinate variances. `"position_score"` fits the square root of position variance divided by gradient variance. `"fixed"` keeps the initial diagonal and tunes the step size. |
+| `initial`, `include_initial` | `"provided"` starts from the inverse mass in `jobs`. `"gradient"` uses the clipped reciprocal magnitude of the starting gradient and uses the supplied entry for zero gradients. Set `include_initial=True` to seed the fit with the starting position and gradient once. |
+| `memory`, `switch_interval` | `"window"` clears the observations at each switch. `"cumulative"` keeps them. `"overlapping"` collects a second estimate in parallel, promotes it at a switch and starts a new background estimate. Switch at metric-window boundaries (default) or after an integer count in `switch_clock`, which defaults to the metric-window clock. |
+| `update_interval` | Install the estimate at each metric-window boundary (default), or additionally after a positive count of transitions or gradients in `update_clock`. A value of 1 with the default transition clock applies the diagonal to the next trajectory. Updates always wait for a complete trajectory. |
+| `variance`, `shrinkage` | `"population"` computes centered, weighted population variance. `"pre_update"` measures deviations from the previous running mean as in nutpie, adding within-trajectory variance for NUTS weights. `shrinkage` is the prior weight on the installed log diagonal at each fit (default 3, zero for a full update). The data weight counts trajectories, or individual eligible leaves for the leaf source. Unidentified coordinates keep their previous values. |
+| `schedule` | `FixedWindows(metric_windows=(...), final_window=..., clock=...)` specifies the lengths in `"transitions"` or `"gradients"`. `AdaptiveWindows(...)` tests evidence at growing per-chain window boundaries. Both schedules accept a separate `final_clock` for the step-size-only window. |
+| `acceptance`, `restart_dual` | Dual averaging can use mean acceptance, symmetric acceptance over the leapfrog steps, or symmetric acceptance only during final calibration (`"mean"`, `"symmetric"`, `"late_symmetric"`). `restart_dual=True` restarts the step-size controller at each metric-window boundary. |
+
+The adaptive test estimates a fresh diagonal in each of two consecutive, disjoint windows.
+For each coordinate it takes the square root of the ratio of the two estimates. Metric
+learning ends when all coordinates are identified and the largest ratio divided by the
+smallest is below `tolerance`. The comparison allows a common change of scale that the
+step size can absorb. It measures stability of the diagonal shape. Posterior accuracy still
+requires diagnostics on retained draws. Set `AdaptiveWindows(evidence=...)` to give this
+test a different source from the fitted metric. On exhaustion of `max_windows` warmup
+raises an error identifying the affected jobs. Unused metric windows have zero counts.
+The last column always records final step-size calibration.
 
 ## What you provide, and what the package leaves out
 
@@ -230,7 +271,7 @@ python benchmarks/benchmark.py
 
 ## How it works
 
-`src/batched_nuts/nuts.py` is the whole implementation.
+The sampling loop is in `src/batched_nuts/nuts.py`. The per-lane adaptation is in `warmup.py`.
 
 - `_step` advances one lane by one leapfrog step and does the bookkeeping of NUTS for
   it without any Python control flow, so that `jax.vmap` turns it into the step of all
