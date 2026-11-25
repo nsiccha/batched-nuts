@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from batched_nuts.metric import MetricFactor
 from batched_nuts.nuts import (
     Jobs,
     _advance,
@@ -20,7 +21,14 @@ from batched_nuts.nuts import (
     _prepare_queue,
     _where,
 )
-from batched_nuts.policy import AdaptiveWindows, DiagonalAdaptation, FixedWindows, _choice
+from batched_nuts.policy import (
+    AdaptiveWindows,
+    DiagonalAdaptation,
+    FixedWindows,
+    StructuredAdaptation,
+    _choice,
+)
+from batched_nuts.structured import _prepare_factor, _update_window, _window
 
 
 class WarmupResult(NamedTuple):
@@ -114,13 +122,9 @@ class TreeEvidence(NamedTuple):
     subtree: Moments
     trajectory: Moments
     indices: Indices
-    symmetric_sum: Any
 
 
-class Adaptation(NamedTuple):
-    step: Any
-    metric: Any
-    dual: DualAveraging
+class DiagonalState(NamedTuple):
     tree: TreeEvidence
     active: Evidence
     background: Evidence
@@ -128,6 +132,14 @@ class Adaptation(NamedTuple):
     update_work: Any
     window: Evidence
     last_shape: Any
+
+
+class Adaptation(NamedTuple):
+    step: Any
+    metric: Any
+    dual: DualAveraging
+    symmetric_sum: Any
+    fit: Any
     phase: Any
     failed: Any
     evaluations: Any
@@ -135,28 +147,26 @@ class Adaptation(NamedTuple):
     divergences: Any
 
 
-def _initial(position, grad, step, metric, n_windows, include_initial=False):
-    point = _point(position, grad)
+def _initial(position, grad, step, metric, n_windows, include_initial=False, policy=None):
     zero = jnp.int32(0)
-    tree = TreeEvidence(point, point, Indices(zero, zero, zero, zero), 0 * step)
-    start = Evidence(point, jnp.int32(include_initial))
+    if isinstance(policy, StructuredAdaptation):
+        fit = _window(metric, policy.capacity)
+    else:
+        point = _point(position, grad)
+        tree = TreeEvidence(point, point, Indices(zero, zero, zero, zero))
+        start = Evidence(point, jnp.int32(include_initial))
+        fit = DiagonalState(
+            tree,
+            start,
+            start,
+            zero,
+            zero,
+            _empty_evidence(point),
+            jnp.full_like(position, jnp.nan),
+        )
     counts = jnp.zeros(n_windows, jnp.int32)
     return Adaptation(
-        step,
-        metric,
-        _start_dual(step),
-        tree,
-        start,
-        start,
-        zero,
-        zero,
-        _empty_evidence(point),
-        jnp.full_like(metric, jnp.nan),
-        zero,
-        False,
-        counts,
-        counts,
-        counts,
+        step, metric, _start_dual(step), 0 * step, fit, zero, False, counts, counts, counts
     )
 
 
@@ -187,11 +197,10 @@ def _track_tree(
     take_tree,
     ended,
     divergent,
-    acceptance,
 ):
     """Share leaf arithmetic between the fitting estimate and its independent monitor."""
     observations = {}
-    subtree, trajectory, indices, symmetric_sum = previous
+    subtree, trajectory, indices = previous
     for source in sources:
         if source == "eligible_leaves":
             valid = (delta > -jnp.log(100.0)) & jnp.all(jnp.isfinite(leaf.mean))
@@ -216,46 +225,39 @@ def _track_tree(
             )
         else:
             observations[source] = Evidence(chosen, ended.astype(jnp.int32))
-    if acceptance != "mean":
-        symmetric_sum += 2 * jax.nn.sigmoid(-jnp.abs(delta))
     tree = TreeEvidence(
         subtree,
         _where(ended, chosen, trajectory),
         indices,
-        jnp.where(ended, 0, symmetric_sum),
     )
-    return tree, observations, symmetric_sum
+    return tree, observations
 
 
 def _clock(clock, steps, transitions):
     return steps if clock == "gradients" else transitions
 
 
-def _warm_step(
-    logdensity,
-    max_depth,
+def _update_diagonal(
     policy,
     schedule,
-    acceptance,
-    restart_dual,
-    budgets,
-    target,
-    chain,
     lane,
+    rec,
+    ended,
+    leaf,
+    prob,
+    delta,
+    take_leaf,
+    take_tree,
     stats,
-    *,
-    stream=False,
-    sampling_key=None,
+    metric,
+    boundary,
+    final,
 ):
-    chain = chain._replace(step_size=stats.step, inverse_mass=stats.metric)
-    lane, rec, ended, sub_done, leaf, prob, delta, take_leaf, take_tree = _advance(
-        logdensity, max_depth, chain, lane, warmup_info=True
-    )
     adaptive = isinstance(schedule, AdaptiveWindows)
     monitor = (schedule.evidence or policy.evidence) if adaptive else policy.evidence
     sources = tuple(dict.fromkeys((policy.evidence, monitor)))
     selected = _point(lane.proposal.position, lane.proposal.grad)
-    tree, observations, symmetric_sum = _track_tree(
+    tree, observations = _track_tree(
         stats.tree,
         sources,
         lane.direction,
@@ -267,19 +269,10 @@ def _warm_step(
         take_tree,
         ended,
         rec.is_divergent,
-        acceptance,
     )
     observation = observations[policy.evidence]
     empty = _empty_evidence(selected)
 
-    phase = stats.phase
-    last = budgets.size - 1
-    final = phase == last
-    evaluations = stats.evaluations[phase] + rec.num_integration_steps
-    transitions = stats.transitions[phase] + 1
-    cost = _clock(schedule.clock, evaluations, transitions)
-    final_cost = _clock(schedule.final_clock or schedule.clock, evaluations, transitions)
-    boundary = ended & (jnp.where(final, final_cost, cost) >= budgets[phase])
     window, shape = stats.window, stats.last_shape
     stable = jnp.bool_(False)
     if adaptive:
@@ -315,7 +308,6 @@ def _warm_step(
     install = boundary
     if policy.update_interval != "window":
         install |= ended & (update_work >= policy.update_interval)
-    metric = stats.metric
     if policy.estimator != "fixed":
         metric = jnp.where(
             install & ~final & (active.weight > 0),
@@ -331,8 +323,82 @@ def _warm_step(
     if policy.memory == "window":
         active = _where(switch, empty, active)
 
+    fit = DiagonalState(
+        tree,
+        _where(final, stats.active, active),
+        _where(final, stats.background, background),
+        jnp.where(ended & ~final, jnp.where(switch, 0, switch_work), stats.switch_work),
+        jnp.where(ended & ~final, jnp.where(install, 0, update_work), stats.update_work),
+        _where(final, stats.window, window),
+        shape,
+    )
+    return fit, metric, stable
+
+
+def _warm_step(
+    logdensity,
+    max_depth,
+    policy,
+    schedule,
+    acceptance,
+    restart_dual,
+    budgets,
+    target,
+    chain,
+    lane,
+    stats,
+    *,
+    stream=False,
+    sampling_key=None,
+):
+    chain = chain._replace(step_size=stats.step, inverse_mass=stats.metric)
+    lane, rec, ended, sub_done, leaf, prob, delta, take_leaf, take_tree = _advance(
+        logdensity, max_depth, chain, lane, warmup_info=True
+    )
+    phase = stats.phase
+    last = budgets.size - 1
+    final = phase == last
+    evaluations = stats.evaluations[phase] + rec.num_integration_steps
+    transitions = stats.transitions[phase] + 1
+    cost = _clock(schedule.clock, evaluations, transitions)
+    final_cost = _clock(schedule.final_clock or schedule.clock, evaluations, transitions)
+    boundary = ended & (jnp.where(final, final_cost, cost) >= budgets[phase])
+    adaptive = isinstance(schedule, AdaptiveWindows)
+    if isinstance(policy, StructuredAdaptation):
+        fit, metric, stable = _update_window(
+            stats.fit,
+            stats.metric,
+            policy,
+            lane,
+            ended,
+            boundary=boundary,
+            fitting=lane.active & (phase < last),
+            tolerance=schedule.tolerance if adaptive else 2.0,
+            key=chain.key,
+        )
+        stable &= phase > 0
+    else:
+        fit, metric, stable = _update_diagonal(
+            policy,
+            schedule,
+            lane,
+            rec,
+            ended,
+            leaf,
+            prob,
+            delta,
+            take_leaf,
+            take_tree,
+            stats.fit,
+            stats.metric,
+            boundary,
+            final,
+        )
+
     alpha = rec.acceptance_rate
+    symmetric_sum = stats.symmetric_sum
     if acceptance != "mean":
+        symmetric_sum += 2 * jax.nn.sigmoid(-jnp.abs(delta))
         use_symmetric = final if acceptance == "late_symmetric" else True
         alpha = jnp.where(use_symmetric, symmetric_sum / rec.num_integration_steps, alpha)
     dual, step = _dual(stats.dual, alpha, target)
@@ -346,13 +412,8 @@ def _warm_step(
         jnp.where(ended, step, stats.step),
         metric,
         _where(ended, dual, stats.dual),
-        tree,
-        _where(final, stats.active, active),
-        _where(final, stats.background, background),
-        jnp.where(ended & ~final, jnp.where(switch, 0, switch_work), stats.switch_work),
-        jnp.where(ended & ~final, jnp.where(install, 0, update_work), stats.update_work),
-        _where(final, stats.window, window),
-        shape,
+        jnp.where(ended, 0, symmetric_sum),
+        fit,
         new_phase,
         failed,
         stats.evaluations.at[phase].add(jnp.where(ended, rec.num_integration_steps, 0)),
@@ -389,7 +450,7 @@ def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restar
         keys = jax.vmap(jax.random.split)(jax.random.wrap_key_data(rows.key))
         rows = rows._replace(key=jax.random.key_data(keys[:, 0]))
         lanes, chains = _assign(logdensity, lanes, chains, take, job, rows, data)
-        if policy.initial == "gradient":
+        if isinstance(policy, DiagonalAdaptation) and policy.initial == "gradient":
             grad = jnp.abs(lanes.proposal.grad)
             limits = jnp.finfo(grad.dtype)
             low, high = max(1e-20, limits.tiny), min(1e20, limits.max)
@@ -402,7 +463,12 @@ def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restar
             )(chains, lanes)
             lanes = jax.vmap(_where)(take, started, lanes)
         initial = jax.vmap(
-            partial(_initial, n_windows=n_windows, include_initial=policy.include_initial)
+            partial(
+                _initial,
+                n_windows=n_windows,
+                policy=policy,
+                include_initial=getattr(policy, "include_initial", False),
+            )
         )(
             lanes.proposal.position,
             lanes.proposal.grad,
@@ -433,7 +499,8 @@ def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restar
                 restart_dual,
                 budgets,
                 target,
-            )
+            ),
+            axis_name="lanes",
         )
 
         def iteration(state):
@@ -450,13 +517,33 @@ def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restar
 
 
 def _prepare_warmup(
-    logdensity, jobs, window_evaluations, diagonal, schedule, acceptance,
-    restart_dual, target_acceptance, data, num_lanes, max_depth,
+    logdensity,
+    jobs,
+    window_evaluations,
+    diagonal,
+    schedule,
+    acceptance,
+    restart_dual,
+    target_acceptance,
+    data,
+    num_lanes,
+    max_depth,
+    structured=None,
 ):
-    if diagonal is None:
-        diagonal = DiagonalAdaptation()
-    if not isinstance(diagonal, DiagonalAdaptation):
+    if structured is not None and not isinstance(structured, StructuredAdaptation):
+        raise TypeError("structured must be a StructuredAdaptation.")
+    if diagonal is not None and (
+        structured is not None or isinstance(jobs.inverse_mass, MetricFactor)
+    ):
+        raise ValueError(
+            "Choose structured adaptation or a diagonal policy with diagonal jobs."
+        )
+    if diagonal is not None and not isinstance(diagonal, DiagonalAdaptation):
         raise TypeError("diagonal must be a DiagonalAdaptation.")
+    if structured is None and isinstance(jobs.inverse_mass, MetricFactor):
+        structured = StructuredAdaptation()
+    if structured is None and diagonal is None:
+        diagonal = DiagonalAdaptation()
     if schedule is not None and window_evaluations is not None:
         raise ValueError("Specify either schedule or window_evaluations.")
     if schedule is None:
@@ -469,9 +556,15 @@ def _prepare_warmup(
             schedule = FixedWindows(lengths[:-1], lengths[-1])
     if not isinstance(schedule, (FixedWindows, AdaptiveWindows)):
         raise TypeError("schedule must be FixedWindows or AdaptiveWindows.")
-    if isinstance(schedule, AdaptiveWindows) and diagonal.estimator == "fixed":
+    if isinstance(schedule, AdaptiveWindows) and diagonal and diagonal.estimator == "fixed":
         raise ValueError("A metric-stability endpoint requires a learned diagonal.")
     _choice("acceptance", acceptance, ("mean", "symmetric", "late_symmetric"))
+    if (
+        structured is not None
+        and isinstance(schedule, AdaptiveWindows)
+        and schedule.evidence not in (None, "selected")
+    ):
+        raise ValueError("Structured adaptation monitors its window of selected draws.")
     budgets = schedule.lengths()
     max_depth = index(max_depth)
     if not 1 <= max_depth <= 30:
@@ -490,7 +583,8 @@ def _prepare_warmup(
             raise ValueError("Window budgets exceed the supported int32 count range.")
     # The PRNG draw index and cumulative evidence counters also live on the device.
     if max_transitions >= np.iinfo(np.int32).max or (
-        diagonal.evidence == "eligible_leaves"
+        diagonal is not None
+        and diagonal.evidence == "eligible_leaves"
         and diagonal.memory != "window"
         and max_evaluations >= np.iinfo(np.int32).max
     ):
@@ -505,6 +599,8 @@ def _prepare_warmup(
     if width < 1 or dim < 1:
         raise ValueError("Warmup requires a chain, a coordinate and a lane.")
     for name, shape in (("step_size", (n_jobs,)), ("inverse_mass", (n_jobs, dim))):
+        if name == "inverse_mass" and isinstance(queue.inverse_mass, MetricFactor):
+            continue
         arr = getattr(queue, name)
         if arr.shape != shape or not np.all(np.isfinite(arr) & (arr > 0)):
             raise ValueError(
@@ -512,7 +608,11 @@ def _prepare_warmup(
             )
     if not np.all(np.isfinite(queue.position)):
         raise ValueError("Starting positions must be finite.")
-    return logdensity, queue, width, budgets, diagonal, schedule, max_depth
+    if structured is not None:
+        queue = queue._replace(
+            inverse_mass=_prepare_factor(queue.inverse_mass, structured.max_reflections)
+        )
+    return logdensity, queue, width, budgets, structured or diagonal, schedule, max_depth
 
 
 def warmup(
@@ -521,6 +621,7 @@ def warmup(
     *,
     window_evaluations=None,
     diagonal=None,
+    structured=None,
     schedule=None,
     acceptance="mean",
     restart_dual=True,
@@ -529,9 +630,11 @@ def warmup(
     num_lanes=None,
     max_depth=10,
 ) -> WarmupResult:
-    """Learn one diagonal inverse mass and step size for each chain.
+    """Learn an inverse mass and step size for each chain.
 
-    Choose the diagonal estimator with `diagonal` and the stopping rule with a
+    A MetricFactor starts structured fitting. Set `structured=StructuredAdaptation()`
+    to fit candidate frames from diagonal jobs too. Set `diagonal` for diagonal-only
+    adaptation. Choose the stopping rule with a
     `FixedWindows` or `AdaptiveWindows` schedule. As shorthand, `window_evaluations`
     gives fixed per-chain gradient budgets, including the final step-size-only window.
     The default budgets are (1000, 2000, 1000). A chain always completes its trajectory.
@@ -542,31 +645,41 @@ def warmup(
     Per-window counts exclude initialization. Adaptive schedules leave unused metric
     windows at zero and store final calibration counts in the last column.
     """
-    logdensity, queue, width, budgets, diagonal, schedule, max_depth = _prepare_warmup(
-        logdensity, jobs, window_evaluations, diagonal, schedule, acceptance, restart_dual,
-        target_acceptance, data, num_lanes, max_depth,
+    logdensity, queue, width, budgets, policy, schedule, max_depth = _prepare_warmup(
+        logdensity,
+        jobs,
+        window_evaluations,
+        diagonal,
+        schedule,
+        acceptance,
+        restart_dual,
+        target_acceptance,
+        data,
+        num_lanes,
+        max_depth,
+        structured,
     )
     n_jobs, dim = queue.position.shape
     dtype = queue.position.dtype
     n_windows = len(budgets)
-    lanes, chains = _empty_lanes(width, dim, dtype, max_depth, data)
-    stats = jax.vmap(partial(_initial, n_windows=n_windows))(
+    lanes, chains = _empty_lanes(width, dim, dtype, max_depth, data, queue.inverse_mass)
+    stats = jax.vmap(partial(_initial, n_windows=n_windows, policy=policy))(
         lanes.proposal.position,
         lanes.proposal.grad,
         jnp.ones(width, dtype),
-        jnp.ones((width, dim), dtype),
+        chains.inverse_mass,
     )
     keys = np.empty_like(queue.key)
     frozen = Jobs(
         keys,
         np.empty_like(queue.position),
         np.empty_like(queue.step_size),
-        np.empty_like(queue.inverse_mass),
+        jax.tree.map(np.empty_like, queue.inverse_mass),
         jobs.dataset,
     )
     counts = [np.empty((n_jobs, n_windows), np.int32) for _ in range(3)]
     refill, run = _compiled_warmup(
-        logdensity, max_depth, diagonal, schedule, acceptance, restart_dual
+        logdensity, max_depth, policy, schedule, acceptance, restart_dual
     )
     next_job = 0
     active = np.zeros(width, bool)
@@ -605,7 +718,10 @@ def warmup(
         ids = job_ids[finished]
         frozen.position[ids] = np.asarray(lanes.proposal.position[finished])
         frozen.step_size[ids] = np.asarray(stats.step[finished])
-        frozen.inverse_mass[ids] = np.asarray(stats.metric[finished])
+        for output, values in zip(
+            jax.tree.leaves(frozen.inverse_mass), jax.tree.leaves(stats.metric), strict=True
+        ):
+            output[ids] = np.asarray(values[finished])
         for output, values in zip(
             counts, (stats.evaluations, stats.transitions, stats.divergences), strict=True
         ):

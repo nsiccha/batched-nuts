@@ -36,11 +36,11 @@ belong to a different posterior: every chain names the slice of the data its log
 reads. This is what keeps a device busy in a simulation study with thousands of small
 posteriors.
 
-The transition itself is the one of `blackjax.nuts` (version 1.7.1, with its defaults:
-velocity Verlet, at most 10 doublings, divergence at an energy error of 1000), for a
-diagonal mass matrix. Given the same random keys it builds the same trajectories and
-returns the same draws; [what the tests show](#what-the-tests-show) says exactly how
-far "the same" goes.
+The transition follows `blackjax.nuts` 1.7.1 with velocity Verlet, at most 10 doublings,
+and a divergence threshold of 1000. With a diagonal inverse mass and the same random
+keys, it reproduces the trajectories and draws described in
+[what the tests show](#what-the-tests-show). For a correlated target, each chain can
+carry its own [compact metric factor](#correlated-metrics).
 
 ## Usage
 
@@ -175,10 +175,59 @@ test a different source from the fitted metric. On exhaustion of `max_windows` w
 raises an error identifying the affected jobs. Unused metric windows have zero counts.
 The last column always records final step-size calibration.
 
+## Correlated metrics
+
+A job can carry a factor `L` of its inverse mass `L @ L.T`. With a Pathfinder
+covariance of the form `diag(a) + B @ C @ B.T`, pass the diagonal variances, basis,
+and symmetric core for each chain. The low-rank correction may have either sign.
+The resulting covariance must be positive definite.
+
+```python
+from batched_nuts import MetricFactor, StructuredAdaptation
+
+# a: (chains, dim), B: (chains, dim, rank), C: (chains, rank, rank)
+factor = MetricFactor.from_low_rank(a, B, C)
+jobs = jobs._replace(inverse_mass=factor)
+policy = StructuredAdaptation(capacity=64, max_reflections=8, score="mean_product")
+fit = batched_nuts.warmup(logdensity, jobs, data=data, structured=policy)
+draws = batched_nuts.sample(logdensity, fit.jobs, num_draws=100, data=data)
+```
+
+`sample` takes the supplied factor directly. In `warmup` or `sample_batches` with
+a schedule, a factor starts the first trajectory in the supplied frame and enables
+structured adaptation. Passing `structured=policy` with ordinary diagonal jobs
+also enables it. The fitted factor is carried through lane refill and frozen for
+sampling. Positions and log densities are returned in the target's original coordinates.
+
+At each metric-window boundary the chain fits three frames to the same uniform
+reservoir of up to `capacity` completed NUTS proposals and their gradients.
+One frame uses the supplied factor, one uses the original axes, and one learns
+up to `max_reflections` Householder reflections. The reflection search examines
+leading gradient directions among coordinates with large squared log-products.
+Each frame fits an additional diagonal scale from position and gradient spread.
+
+For a frame `L`, compute `u` per coordinate as the sample standard deviation of
+`solve(L, position)` times that of `L.T @ gradient`. The default score averages
+`u` across coordinates. Set `score="squared_log"` to minimize `sum(log(u)**2)`.
+A window without a finite candidate score keeps the current metric. An adaptive
+schedule permits stopping from its second fitting window when both the spread of
+the active frame's diagonal scale corrections and the improvement in frame score
+fall below its tolerance. The final window calibrates only the step size.
+
+The retained evidence uses `2 * capacity * dim` floats per lane. The factor
+stores two diagonal vectors, the reflection vectors, and a small triangular block.
+The thin singular-value decomposition at a window boundary uses a matrix of shape
+`(capacity, dim)`. The original diagonal policy keeps its streaming moment estimates.
+
+Run `PYTHONPATH=src python benchmarks/structured_warmup.py` for a matched
+correlated-Gaussian comparison of time to first draw, pooled effective sample
+size and gradient cost. It uses independent chains to estimate the variance of
+the pooled mean along the long axis of the Gaussian.
+
 ## What you provide, and what the package leaves out
 
 - **Step size and mass matrix.** Every chain has a fixed step size and a fixed diagonal
-  inverse mass matrix during sampling. Supply them in `Jobs` or use the jobs returned
+  or structured inverse mass matrix during sampling. Supply them in `Jobs` or use the jobs returned
   by `warmup`. The benchmark uses `blackjax.window_adaptation` for its common start.
 - **Positions are vectors.** Flatten a structured position yourself, for example with
   `jax.flatten_util.ravel_pytree`.

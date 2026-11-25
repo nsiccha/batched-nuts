@@ -109,3 +109,19 @@ class AdaptiveWindows:
 def _validate_clocks(clock, final_clock):
     _choice("clock", clock, ("gradients", "transitions"))
     _choice("final_clock", final_clock, (None, "gradients", "transitions"))
+
+
+@dataclass(frozen=True)
+class StructuredAdaptation:
+    """Fit three metric frames to a bounded sample of completed NUTS transitions."""
+
+    score: str = "mean_product"
+    capacity: int = 64
+    max_reflections: int = 8
+
+    def __post_init__(self):
+        _choice("score", self.score, ("mean_product", "squared_log"))
+        if _positive(self.capacity, "capacity") < 2:
+            raise ValueError("capacity must allow at least two observations.")
+        if isinstance(self.max_reflections, bool) or index(self.max_reflections) < 0:
+            raise ValueError("max_reflections must be a nonnegative integer.")

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+Added compact per-chain factors for fixed sampling and windowed warmup. Structured
+warmup selects between supplied, diagonal, and learned Householder frames.
+
 ## 0.1.3
 
 Added bounded streaming of completed draws with exact parallel-round timestamps.

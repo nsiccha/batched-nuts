@@ -30,14 +30,14 @@ class DrawBatch(NamedTuple):
 
 
 @lru_cache(maxsize=16)
-def _mixed_loop(target, max_depth, diagonal, schedule, acceptance, restart_dual):
+def _mixed_loop(target, max_depth, policy, schedule, acceptance, restart_dual):
     def run(state, chains, stats, keys, budgets, target_accept, limit, first):
         state = state._replace(num_records=jnp.int32(0), num_iterations=jnp.int32(0))
         step = partial(
             _warm_step,
             target,
             max_depth,
-            diagonal,
+            policy,
             schedule,
             acceptance,
             restart_dual,
@@ -62,7 +62,8 @@ def _mixed_loop(target, max_depth, diagonal, schedule, acceptance, restart_dual)
         def advance(carry):
             state, chains, stats = carry
             chains, lanes, stats, records, done = jax.vmap(
-                lambda chain, lane, adapt, key: step(chain, lane, adapt, sampling_key=key)
+                lambda chain, lane, adapt, key: step(chain, lane, adapt, sampling_key=key),
+                axis_name="lanes",
             )(chains, state.lanes, stats, keys)
             state = state._replace(
                 lanes=lanes,
@@ -110,6 +111,7 @@ def sample_batches(
     data=None,
     schedule=None,
     diagonal=None,
+    structured=None,
     acceptance="mean",
     restart_dual=True,
     target_acceptance=0.8,
@@ -121,6 +123,7 @@ def sample_batches(
     """Run one lane per job. Yield bounded host batches without a per-chain draw quota.
 
     With a warmup schedule, each chain begins sampling when its own adaptation ends.
+    Use `structured` or supply a MetricFactor to fit correlated metrics.
     With fitted jobs, omit the schedule. The first completed draw is yielded during
     the round that produced it (possibly with simultaneous draws). Later transfers
     use the record buffer. Set rounds_per_batch to also yield at round checkpoints,
@@ -141,6 +144,7 @@ def sample_batches(
     if schedule is None:
         if (
             diagonal is not None
+            or structured is not None
             or acceptance != "mean"
             or not restart_dual
             or target_acceptance != 0.8
@@ -148,7 +152,7 @@ def sample_batches(
             raise ValueError("A warmup schedule is required for adaptation settings.")
         target, queue = _prepare_queue(logdensity, jobs, data)
     else:
-        target, queue, _, lengths, diagonal, schedule, _ = _prepare_warmup(
+        target, queue, _, lengths, policy, schedule, _ = _prepare_warmup(
             logdensity,
             jobs,
             None,
@@ -160,6 +164,7 @@ def sample_batches(
             data,
             None,
             max_depth,
+            structured,
         )
     width, dim = queue.position.shape
     if min(width, dim) < 1:
@@ -170,7 +175,7 @@ def sample_batches(
     if max_rounds == 0:
         return
     dtype = queue.position.dtype
-    state, chains = _empty(width, dim, dtype, max_depth, size, data)
+    state, chains = _empty(width, dim, dtype, max_depth, size, data, queue.inverse_mass)
     take, ids = np.ones(width, bool), np.arange(width, dtype=np.int32)
     refill, loop = _compiled(target, max_depth)
     stats = None
@@ -179,14 +184,14 @@ def sample_batches(
     else:
         budgets = jnp.asarray(lengths, jnp.int32)
         accept = jnp.asarray(target_acceptance, dtype)
-        stats = jax.vmap(partial(_initial, n_windows=len(lengths)))(
+        stats = jax.vmap(partial(_initial, n_windows=len(lengths), policy=policy))(
             state.lanes.proposal.position,
             state.lanes.proposal.grad,
             chains.step_size,
             chains.inverse_mass,
         )
         init, _ = _compiled_warmup(
-            target, max_depth, diagonal, schedule, acceptance, restart_dual
+            target, max_depth, policy, schedule, acceptance, restart_dual
         )
         lanes, chains, stats, sampling_keys, valid = init(
             state.lanes, chains, stats, take, ids, queue, data
@@ -196,7 +201,7 @@ def sample_batches(
         state = state._replace(lanes=lanes)
         del lanes
         keys = jax.random.wrap_key_data(sampling_keys)
-        mixed = _mixed_loop(target, max_depth, diagonal, schedule, acceptance, restart_dual)
+        mixed = _mixed_loop(target, max_depth, policy, schedule, acceptance, restart_dual)
     first = True
     rounds = 0
     progress = np.zeros(width, np.int64)

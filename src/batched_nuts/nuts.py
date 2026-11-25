@@ -24,6 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from batched_nuts.metric import MetricFactor, _apply, _momentum, _validate_factor, _velocity
+
 DIVERGENCE_THRESHOLD = 1000
 
 
@@ -33,7 +35,7 @@ class Jobs(NamedTuple):
     key: Any  # (num_jobs,) PRNG keys; transition t of a chain uses `fold_in(key, t)`
     position: Any  # (num_jobs, dim) initial positions
     step_size: Any  # (num_jobs,)
-    inverse_mass: Any  # (num_jobs, dim) diagonal of the inverse mass matrix
+    inverse_mass: Any  # (num_jobs, dim) diagonal inverse mass, or MetricFactor
     dataset: Any = None  # (num_jobs,) which slice of `data` the chain's density reads
 
 
@@ -135,14 +137,17 @@ def _where(condition, a, b):
 
 
 def _kinetic_energy(inverse_mass, momentum):
+    if isinstance(inverse_mass, MetricFactor):
+        whitened = _apply(inverse_mass, momentum, transpose=True)
+        return 0.5 * jnp.dot(whitened, whitened)
     return 0.5 * jnp.dot(inverse_mass * momentum, momentum)
 
 
 def _is_turning(inverse_mass, momentum_left, momentum_right, momentum_sum):
     """The generalized U-turn criterion for a stretch of trajectory (or a stack of them)."""
     rho = momentum_sum - (momentum_right + momentum_left) / 2
-    turning_left = jnp.sum(inverse_mass * momentum_left * rho, axis=-1) <= 0
-    turning_right = jnp.sum(inverse_mass * momentum_right * rho, axis=-1) <= 0
+    turning_left = jnp.sum(_velocity(inverse_mass, momentum_left) * rho, axis=-1) <= 0
+    turning_right = jnp.sum(_velocity(inverse_mass, momentum_right) * rho, axis=-1) <= 0
     return turning_left | turning_right
 
 
@@ -167,7 +172,7 @@ def _begin_transition(chain: Chain, lane: Lane) -> Lane:
     dtype = state.position.dtype
     momentum_key, tree_key = jax.random.split(jax.random.fold_in(chain.key, lane.draw), 2)
     noise = jax.random.normal(momentum_key, state.position.shape, dtype)
-    momentum = (1 / jnp.sqrt(chain.inverse_mass)) * noise
+    momentum = _momentum(chain.inverse_mass, noise)
     end = Point(state.position, momentum, state.grad)
     return lane._replace(
         proposal=state._replace(
@@ -201,7 +206,7 @@ def _advance(logdensity, max_depth, chain: Chain, lane: Lane, *, warmup_info=Fal
     start = _where(forward, lane.right, lane.left)
     step_size = lane.direction * chain.step_size
     momentum = start.momentum + step_size * 0.5 * start.grad
-    position = start.position + step_size * (inverse_mass * momentum)
+    position = start.position + step_size * _velocity(inverse_mass, momentum)
     logp, grad = jax.value_and_grad(logdensity)(position, chain.data)
     momentum = momentum + step_size * 0.5 * grad
     end = Point(position, momentum, grad)
@@ -341,8 +346,14 @@ def _iteration(logdensity, max_depth, chains: Chain, num_draws, state: State) ->
 
 
 def _loop(
-    logdensity, max_depth, state: State, chains: Chain, num_draws, chains_waiting,
-    max_rounds=None, first_draw=False,
+    logdensity,
+    max_depth,
+    state: State,
+    chains: Chain,
+    num_draws,
+    chains_waiting,
+    max_rounds=None,
+    first_draw=False,
 ):
     """Iterate until the host has something to do.
 
@@ -380,7 +391,7 @@ def _assign(logdensity, lanes: Lane, chains: Chain, take, job, jobs: Jobs, data)
         job=choose(job, chains.job),
         key=choose(jax.random.wrap_key_data(jobs.key), chains.key),
         step_size=choose(jobs.step_size, chains.step_size),
-        inverse_mass=choose(jobs.inverse_mass, chains.inverse_mass),
+        inverse_mass=jax.tree.map(choose, jobs.inverse_mass, chains.inverse_mass),
         data=jax.tree.map(
             lambda table, old: choose(table[jobs.dataset], old), data, chains.data
         ),
@@ -411,7 +422,7 @@ def _compiled(logdensity: Callable, max_depth: int):
     return refill, loop
 
 
-def _empty_lanes(num_lanes, dim, dtype, max_depth, data):
+def _empty_lanes(num_lanes, dim, dtype, max_depth, data, metric=None):
     """Lanes without chains."""
     scalar, vector = jnp.zeros((), dtype), jnp.zeros(dim, dtype)
     table = jnp.zeros((max_depth, dim), dtype)
@@ -439,7 +450,12 @@ def _empty_lanes(num_lanes, dim, dtype, max_depth, data):
         checkpoint_momentum=table,
         checkpoint_sum=table,
     )
-    chain = Chain(index, key, scalar, vector, jax.tree.map(lambda x: x[0], data))
+    initial_metric = (
+        jax.tree.map(lambda x: jnp.asarray(x[0]), metric)
+        if isinstance(metric, MetricFactor)
+        else vector
+    )
+    chain = Chain(index, key, scalar, initial_metric, jax.tree.map(lambda x: x[0], data))
 
     return _repeat(lane, num_lanes), _repeat(chain, num_lanes)
 
@@ -449,8 +465,8 @@ def _repeat(tree, n):
     return jax.tree.map(lambda x: jnp.broadcast_to(x, (n,) + jnp.shape(x)), tree)
 
 
-def _empty(num_lanes, dim, dtype, max_depth, buffer_size, data):
-    lanes, chains = _empty_lanes(num_lanes, dim, dtype, max_depth, data)
+def _empty(num_lanes, dim, dtype, max_depth, buffer_size, data, metric=None):
+    lanes, chains = _empty_lanes(num_lanes, dim, dtype, max_depth, data, metric)
     index = jnp.int32(0)
     scalar, vector = jnp.zeros((), dtype), jnp.zeros(dim, dtype)
     record = Record(index, index, vector, scalar, index, False, False, scalar)
@@ -482,7 +498,11 @@ def _prepare_queue(logdensity, jobs, data):
         key=np.asarray(jax.random.key_data(jobs.key)),
         position=position,
         step_size=np.asarray(jobs.step_size, dtype),
-        inverse_mass=np.asarray(jobs.inverse_mass, dtype),
+        inverse_mass=(
+            _validate_factor(jobs.inverse_mass, position.shape, dtype)
+            if isinstance(jobs.inverse_mass, MetricFactor)
+            else np.asarray(jobs.inverse_mass, dtype)
+        ),
         dataset=dataset,
     )
     return logdensity, queue
@@ -495,7 +515,7 @@ def _assignment(active, queue, next_job):
     take = np.zeros(len(active), bool)
     job = np.zeros(len(active), np.int32)
     take[idle], job[idle] = True, np.arange(next_job, next_job + len(idle))
-    return take, job, Jobs(*(x[job] for x in queue)), next_job + len(idle)
+    return take, job, jax.tree.map(lambda x: x[job], queue), next_job + len(idle)
 
 
 def sample(
@@ -516,8 +536,8 @@ def sample(
         The log density of one chain's target: `logdensity(position)`, or
         `logdensity(position, data_slice)` when `data` is given.  `position` is a vector.
     jobs
-        The chains: keys, initial positions, step sizes and diagonal inverse mass
-        matrices, one row per chain.  Transition `t` of a chain is the transition of
+        The chains: keys, positions, step sizes and inverse mass diagonals or factors.
+        With a diagonal, transition `t` of a chain is the transition of
         `blackjax.nuts` with the key `jax.random.fold_in(key, t)`.
     num_draws
         Draws per chain.
@@ -563,7 +583,9 @@ def sample(
         return state._replace(num_records=jnp.zeros((), jnp.int32))
 
     refill, loop = _compiled(logdensity, max_depth)
-    state, chains = _empty(num_lanes, dim, dtype, max_depth, buffer_size, data)
+    state, chains = _empty(
+        num_lanes, dim, dtype, max_depth, buffer_size, data, queue.inverse_mass
+    )
     next_job = num_iterations = num_evaluations = 0
     while True:
         assignment = _assignment(state.lanes.active, queue, next_job)
