@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from batched_nuts.branching import Branching, BranchOrigin, _Branches, _History
 from batched_nuts.nuts import (
     Jobs,
     Record,
@@ -36,6 +37,16 @@ class DrawBatch(NamedTuple):
     num_rounds: int
     completion_rounds: np.ndarray
     failed_jobs: np.ndarray
+
+
+class BranchBatch(NamedTuple):
+    """Draws and any children admitted after the last round in this batch."""
+
+    records: Record
+    num_rounds: int
+    completion_rounds: np.ndarray
+    failed_jobs: np.ndarray
+    branches: tuple[BranchOrigin, ...]
 
 
 class LoweredStream(NamedTuple):
@@ -85,8 +96,10 @@ def _mixed_loop(
     restart_dual,
     observe=False,
     window_evidence=False,
+    save_history=False,
+    stop_at_freeze=False,
 ):
-    def run(state, chains, stats, keys, budgets, target_accept, limit, first):
+    def run(state, chains, stats, keys, budgets, target_accept, limit, first, history=None):
         state = state._replace(num_iterations=jnp.int32(0))
         if not observe:
             state = state._replace(num_records=jnp.int32(0))
@@ -103,13 +116,14 @@ def _mixed_loop(
             stream=True,
             observe=observe,
             window_evidence=window_evidence,
+            save_history=save_history,
         )
         width = state.lanes.active.size
         capacity = state.records.job.size
         failed_before = stats.failed
 
         def go_on(carry):
-            state, _, stats, _ = carry
+            state, _, stats, _, _ = carry
             return (
                 (state.num_iterations < limit)
                 & (state.num_records + width <= capacity)
@@ -119,7 +133,7 @@ def _mixed_loop(
             )
 
         def advance(carry):
-            state, chains, stats, _ = carry
+            state, chains, stats, _, history = carry
             result = jax.vmap(
                 lambda chain, lane, adapt, key: step(chain, lane, adapt, sampling_key=key),
                 axis_name="lanes",
@@ -132,7 +146,9 @@ def _mixed_loop(
                 num_records=state.num_records + jnp.sum(done, dtype=jnp.int32),
                 num_iterations=state.num_iterations + 1,
             )
-            return state, chains, stats, events
+            if save_history:
+                history = history.record(result[-1], records)
+            return state, chains, stats, events, history
 
         initial = None
         if observe:
@@ -156,15 +172,21 @@ def _mixed_loop(
         def condition(carry):
             running = go_on(carry)
             if observe:
-                events = carry[-1]
+                events = carry[3]
                 running &= ~jnp.any(events.closed | events.divergent)
+            elif stop_at_freeze:
+                ready = carry[2].phase >= budgets.size
+                running &= ~jnp.any(ready & (stats.phase < budgets.size))
             return running
 
-        carry = jax.lax.while_loop(condition, advance, (state, chains, stats, initial))
+        carry = jax.lax.while_loop(
+            condition, advance, (state, chains, stats, initial, history)
+        )
         # An event-only return leaves buffered draws for their original yield point.
-        return (*carry, go_on(carry)) if observe else carry[:3]
+        result = (*carry[:4], go_on(carry)) if observe else carry[:3]
+        return (*result, carry[4]) if save_history else result
 
-    return jax.jit(run, donate_argnums=(0, 1, 2))
+    return jax.jit(run, donate_argnums=(0, 1, 2, 8) if save_history else (0, 1, 2))
 
 
 def _host_record(column, count):
@@ -264,7 +286,8 @@ def sample_batches(
     rounds_per_batch=None,
     on_warmup: Callable[[tuple[WarmupEvent, ...]], None] | None = None,
     include_window_evidence=False,
-) -> Iterator[DrawBatch]:
+    branching: Branching | None = None,
+) -> Iterator[DrawBatch | BranchBatch]:
     """Run one lane per job. Yield bounded host batches without a per-chain draw quota.
 
     With a warmup schedule, each chain begins sampling when its own adaptation ends.
@@ -281,6 +304,8 @@ def sample_batches(
     If supplied, on_warmup receives tuples of WarmupEvent on the host at each
     event round, before yielding draws from that round. Set include_window_evidence
     to also receive moments from completed adaptive diagonal metric windows.
+    With branching, yield BranchBatch objects. Call branching.choose at eligible
+    freeze, draw and checkpoint batches to admit children with frozen parent tuning.
     """
     yield from _prepare_stream(
         logdensity,
@@ -298,6 +323,7 @@ def sample_batches(
         rounds_per_batch,
         on_warmup,
         include_window_evidence,
+        branching,
         lower=False,
     )
 
@@ -319,6 +345,7 @@ def lower_sample_batches(
     rounds_per_batch=None,
     on_warmup: Callable[[tuple[WarmupEvent, ...]], None] | None = None,
     include_window_evidence=False,
+    branching: Branching | None = None,
 ) -> LoweredStream | None:
     """Lower the startup and first round loop that sample_batches would execute.
 
@@ -345,6 +372,7 @@ def lower_sample_batches(
         rounds_per_batch,
         on_warmup,
         include_window_evidence,
+        branching,
         lower=True,
     )
 
@@ -365,6 +393,7 @@ def _prepare_stream(
     rounds_per_batch,
     on_warmup,
     include_window_evidence,
+    branching,
     *,
     lower,
 ):
@@ -412,6 +441,13 @@ def _prepare_stream(
     size = max(256, width) if buffer_size is None else index(buffer_size)
     if size < width:
         raise ValueError("The buffer must hold at least one simultaneous draw per chain.")
+    if branching is not None and not isinstance(branching, Branching):
+        raise TypeError("branching must be a Branching policy.")
+    branches = (
+        _Branches(branching, queue.dataset, buffer_size, target)
+        if branching is not None
+        else None
+    )
     if max_rounds == 0:
         return None if lower else iter(())
 
@@ -468,7 +504,8 @@ def _prepare_stream(
         outputs = refill(*inputs)
 
     del inputs
-    deliver_events = None
+    deliver_events = mixed_kernel = None
+    history_args = ()
     if schedule is None:
         state, chains = outputs
         step = loop
@@ -487,7 +524,8 @@ def _prepare_stream(
         )
         budgets = jnp.asarray(lengths, jnp.int32)
         round_args = (stats, keys, budgets, jnp.asarray(target_acceptance, dtype))
-        step = _mixed_loop(
+        mixed_kernel = partial(
+            _mixed_loop,
             target,
             max_depth,
             policy,
@@ -497,6 +535,13 @@ def _prepare_stream(
             on_warmup is not None,
             include_window_evidence,
         )
+        can_grow = branching is not None and width < branching.max_chains
+        if can_grow and branching.warmup_history:
+            make_history = partial(
+                _History.empty, width, branching.warmup_history, dim, dtype
+            )
+            history_args = (jax.eval_shape(make_history) if lower else make_history(),)
+        step = mixed_kernel(bool(history_args), can_grow)
         n_windows = len(lengths)
         if on_warmup is not None:
             deliver_events = partial(
@@ -510,7 +555,9 @@ def _prepare_stream(
 
     if lower:
         limit = _round_limit(0, max_rounds, rounds_per_batch)
-        return LoweredStream(startup, step.lower(state, chains, *round_args, limit, True))
+        return LoweredStream(
+            startup, step.lower(state, chains, *round_args, limit, True, *history_args)
+        )
     return _round_batches(
         state,
         chains,
@@ -521,6 +568,9 @@ def _prepare_stream(
         max_rounds,
         rounds_per_batch,
         deliver_events,
+        branches,
+        mixed_kernel,
+        history_args,
     )
 
 
@@ -569,17 +619,21 @@ def _round_batches(
     max_rounds,
     rounds_per_batch,
     deliver_events,
+    branches,
+    mixed_kernel,
+    history_args,
 ):
     width = state.lanes.active.size
     first = True
     rounds = 0
     progress = np.zeros(width, np.int64)
-    frozen = np.zeros(width, bool)
+    frozen = np.full(width, n_windows == 0, bool)
     failed = np.zeros(width, bool)
     while max_rounds is None or rounds < max_rounds:
+        freeze_checkpoint = False
         new_failures = np.empty(0, dtype=np.intp)
         limit = _round_limit(rounds, max_rounds, rounds_per_batch)
-        result = step(state, chains, *round_args, limit, first)
+        result = step(state, chains, *round_args, limit, first, *history_args)
         if step is loop:
             state = result
             del result
@@ -599,28 +653,58 @@ def _round_batches(
                     axis=1, dtype=np.int64
                 )
                 frozen = ready
+            if history_args:
+                history_args = (diagnostics.pop(),)
+                branches.save_frozen(history_args[0], newly_ready, rounds)
+            freeze_checkpoint = (
+                branches is not None and branches.room > 0 and bool(np.any(newly_ready))
+            )
             if deliver_events is not None:
                 events, resume = diagnostics
                 deliver_events(events, rounds, failed)
                 del events, diagnostics
-                if bool(resume):
+                if bool(resume) and not freeze_checkpoint:
                     continue
             if (ready | failed).all():
                 step, round_args = loop, (None, False)
+                history_args = ()
             del stats
         count = int(state.num_records)
         if (
             count
+            or freeze_checkpoint
             or len(new_failures)
             or rounds == max_rounds
             or (rounds_per_batch is not None and rounds % rounds_per_batch == 0)
         ):
             # Host arrays stay valid after the device buffer is donated to the next call.
             records = Record(*(_host_record(x, count) for x in state.records))
-            yield DrawBatch(
+            batch = DrawBatch(
                 records, rounds, _completion_rounds(records, progress), new_failures
             )
-            if count:
+            if branches is None:
+                yield batch
+            else:
+                batch = branches.retained(batch)
+                origins = ()
+                if rounds != max_rounds:
+                    origins, points = branches.choose(batch, frozen)
+                    if origins:
+                        stats, keys = round_args[:2] if step is not loop else (None, None)
+                        state, chains, stats, keys = branches.grow(
+                            state, chains, stats, keys, origins, points
+                        )
+                        if step is not loop:
+                            round_args = (stats, keys, *round_args[2:])
+                            if not branches.room:
+                                history_args = ()
+                                step = mixed_kernel()
+                        del stats, keys, points
+                        progress = np.r_[progress, np.full(len(origins), rounds, np.int64)]
+                        frozen = np.r_[frozen, np.ones(len(origins), bool)]
+                        failed = np.r_[failed, np.zeros(len(origins), bool)]
+                yield BranchBatch(*batch, origins)
+            if len(batch.records.job):
                 first = False
         if len(new_failures) and failed.all():
             return

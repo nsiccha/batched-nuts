@@ -367,6 +367,7 @@ def _warm_step(
     sampling_key=None,
     observe=False,
     window_evidence=False,
+    save_history=False,
 ):
     chain = chain._replace(step_size=stats.step, inverse_mass=stats.metric)
     lane, rec, ended, sub_done, leaf, prob, delta, take_leaf, take_tree = _advance(
@@ -467,8 +468,8 @@ def _warm_step(
                 span,
                 evidence if window_evidence else None,
             )
-            return (*result, event)
-        return result
+            result = (*result, event)
+        return (*result, warming & ended) if save_history else result
     updated = chain._replace(step_size=next_stats.step, inverse_mass=metric)
     lane = _begin_next(updated, lane, ended, sub_done)
     return lane._replace(active=lane.active & ~(boundary & final) & ~failed), next_stats

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7
+
+Streaming runs can admit children from completed parent draws or saved warmup
+transition endpoints. Children inherit frozen tuning, record their ancestry and use
+independent random keys while the original chains keep advancing.
+
 ## 0.1.6
 
 Added `lower_sample_batches` to inspect the compiler plans for stream startup and

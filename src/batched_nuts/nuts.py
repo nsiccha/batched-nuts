@@ -396,18 +396,20 @@ def _assign(logdensity, lanes: Lane, chains: Chain, take, job, jobs: Jobs, data)
             lambda table, old: choose(table[jobs.dataset], old), data, chains.data
         ),
     )
-    logp, grad = jax.vmap(jax.value_and_grad(logdensity))(jobs.position, chains.data)
+    taken = _start_lanes(logdensity, lanes, chains, jobs.position)
+    return jax.vmap(_where)(take, taken, lanes), chains
+
+
+def _start_lanes(logdensity, lanes, chains, position):
+    logp, grad = jax.vmap(jax.value_and_grad(logdensity))(position, chains.data)
     taken = lanes._replace(
         active=jnp.ones_like(lanes.active),
         draw=jnp.zeros_like(lanes.draw),
-        proposal=lanes.proposal._replace(
-            position=jobs.position, logdensity=logp, grad=grad
-        ),
+        proposal=lanes.proposal._replace(position=position, logdensity=logp, grad=grad),
     )
-    taken = jax.vmap(lambda chain, lane: _begin_doubling(_begin_transition(chain, lane)))(
+    return jax.vmap(lambda chain, lane: _begin_doubling(_begin_transition(chain, lane)))(
         chains, taken
     )
-    return jax.vmap(_where)(take, taken, lanes), chains
 
 
 def _refill(logdensity, state, chains, take, job, jobs, data):

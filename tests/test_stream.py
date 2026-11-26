@@ -368,6 +368,7 @@ def test_summary_and_evidence_availability_for_other_warmup_policies(structured)
         ("structured", np.float64, 8),
         ("auto_mesh", np.float32, 8),
         ("events", np.float64, 7),
+        ("branching", np.float64, 8),
     ],
 )
 def test_lower_sample_batches_matches_stream_calls(monkeypatch, mode, dtype, capacity):
@@ -394,6 +395,15 @@ def test_lower_sample_batches_matches_stream_calls(monkeypatch, mode, dtype, cap
             schedule=AdaptiveWindows(first_window=4, max_windows=2, final_window=2),
             on_warmup=callback_events.extend,
             include_window_evidence=True,
+        )
+    if mode == "branching":
+        from batched_nuts import Branching
+
+        def premature_branch(*args):
+            pytest.fail("lowering and the first warmup round cannot admit children")
+
+        options["branching"] = Branching(
+            jax.random.key(8), 1, 5, premature_branch, warmup_history=3
         )
     if mode in ("structured", "auto_mesh"):
         automatic = mode == "auto_mesh"

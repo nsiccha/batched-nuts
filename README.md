@@ -426,6 +426,75 @@ Summary callbacks carry scalars per lane. Requesting moments additionally
 uses per-lane storage proportional to the parameter dimension and transfers
 only closing window rows, in bounded groups. The sampler retains no event history.
 
+### Branch from a warmed chain
+
+Pass `branching` to widen a running stream. The jobs supplied at startup are
+the original chains. A child starts a new trajectory on its parent's dataset,
+with the parent's frozen step size and inverse mass and a fresh random key.
+The parent continues its current trajectory. Each subsequent gradient round
+advances the wider batch together.
+
+This example starts two children after at least two original chains on the same
+dataset have frozen and supplied a post-warmup draw. A caller tracking mixing,
+time remaining or measured gradient latency can return an empty sequence until
+its own criteria are met.
+
+```python
+from batched_nuts import AdaptiveWindows, Branch, Branching, sample_batches
+
+def choose_children(batch, parents, room):
+    available = [p for p in parents if p.draw_round is not None]
+    by_dataset = {}
+    for p in available:
+        group = by_dataset.setdefault(p.dataset, [])
+        group.append(p)
+        if len(group) == 2:
+            return [Branch(parent.job, parent.draw_round) for parent in group[:room]]
+    return []
+
+branch_key = jax.random.key(37)
+policy = Branching(key=branch_key, ready_target=2,
+                   max_chains=len(jobs.position) + 2, choose=choose_children)
+for batch in sample_batches(logdensity, jobs, data=data, schedule=AdaptiveWindows(),
+                            branching=policy, rounds_per_batch=50, max_rounds=50_000):
+    for origin in batch.branches:
+        print(origin.job, origin.parent, origin.source_round, origin.admission_round)
+```
+
+Supply a separate `branch_key` from the random keys used for the original jobs.
+Child IDs follow the original job IDs in admission order. Child `j` uses
+`jax.random.fold_in(branch_key, j)`. Each `BranchOrigin` records the dataset,
+whether the source was a warmup endpoint, and the number of discarded child
+transitions. The first retained child transition has draw number zero and its
+actual completion round on the original stream clock.
+
+Set `warmup_history=h` to keep the last `h` completed warmup transition
+positions per original chain. The bounded device buffer includes the final
+calibration endpoint. The sampler copies these points to the host when the
+parent freezes. The callback can select one with
+`Branch(p.job, p.warmup_rounds[-1], settle=n)`. Choose the settling period
+explicitly for a warmup source. The child runs its first `n` completed
+transitions with the inherited tuning before contributing draws. The source
+position itself contributes no extra draw. With the default history size of
+zero, only the most recent retained draw per eligible parent is available.
+
+The callback receives a draw batch, eligible parents and the remaining capacity
+at freezes, buffer flushes and round checkpoints. It may decline repeatedly or
+request several children from the same source. The readiness threshold counts
+original chains separately for each dataset. Children share their parent's
+history, so they do not provide independent starting points for diagnosing
+mixing. Failed chains cannot become parents. Fitted jobs supplied without a
+warmup schedule count as ready at startup. At the global round limit the
+sampler returns the last records and stops admitting children.
+
+Early gradient calls use the initial width. Each distinct wider shape can incur
+a compilation cost. An explicit draw buffer must hold `max_chains` simultaneous
+records. Without an explicit size, the buffer grows if the actual width
+outgrows it. `lower_sample_batches(..., branching=policy)` inspects the actual
+startup and first round at the initial width, including optional history storage.
+It never calls the admission policy. Omitting `branching` uses the usual
+fixed-width `DrawBatch` stream.
+
 ### Inspect the stream before sampling
 
 `lower_sample_batches` accepts the same density, jobs and keyword arguments as
