@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.10
+
+Added the diagnostics of retained draws: `summary` reports the rank-normalized split
+R-hat and the bulk and tail effective sample sizes of every coordinate, for the draws of
+`sample`, of a run assembled from `sample_batches`, or of any other sampler.
+`split_rhat`, `ess` and `rank_normalize` give the parts on their own.
+
+`sample` now refuses impossible arguments, as `warmup` and `sample_batches` already did:
+a draw count, lane count or buffer size below one, a `max_depth` outside 1 to 30, jobs
+without a chain or a coordinate, and per-chain arrays of the wrong shape. Zero lanes used
+to loop forever without a word, and a zero draw count failed on an `IndexError` only after
+the sampling loop had run.
+
 ## 0.1.9
 
 `hierarchical_start` accepts two ordered `GroupFactor` declarations with a

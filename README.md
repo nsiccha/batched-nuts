@@ -170,7 +170,8 @@ For each coordinate it takes the square root of the ratio of the two estimates. 
 learning ends when all coordinates are identified and the largest ratio divided by the
 smallest is below `tolerance`. The comparison allows a common change of scale that the
 step size can absorb. It measures stability of the diagonal shape. Posterior accuracy still
-requires diagnostics on retained draws. Set `AdaptiveWindows(evidence=...)` to give this
+requires diagnostics on retained draws ([checking the draws](#checking-the-draws)). Set
+`AdaptiveWindows(evidence=...)` to give this
 test a different source from the fitted metric. On exhaustion of `max_windows` warmup
 raises an error identifying the affected jobs. Unused metric windows have zero counts.
 The last column always records final step-size calibration.
@@ -345,6 +346,50 @@ ensemble, using at least 16 draws. This path uses CPU-side sparse algebra and on
 population fit starts at zero by default. A single `GroupFactor` in a list accepts
 the ordinary joint log density and uses the original one-factor algorithm.
 
+## Checking the draws
+
+The sampler returns draws and the diagnostics of each trajectory, not a verdict on whether
+those draws describe the posterior. `summary` gives that verdict: the rank-normalized split
+R-hat and the bulk and tail effective sample sizes of every coordinate, with the mean and
+standard deviation of the draws.
+
+It compares chains that sample the *same* target. The example above runs 200 chains on 50
+different posteriors, so it takes the four chains of one dataset:
+
+```python
+diag = batched_nuts.summary(draws.position[dataset == 0])
+print(diag.rhat, diag.ess_bulk, diag.ess_tail)  # one entry per coordinate
+print(diag.converged())  # R-hat at most 1.01 and 100 effective draws or more, everywhere
+```
+
+`summary` takes a `Draws` or an array of chains of shape (chains, draws[, dimensions]), so it
+also reads a run assembled from `sample_batches` and the chains of any other sampler.
+`split_rhat` and `ess` give the two numbers on their own, and `rank_normalize` is the
+transform underneath:
+
+```python
+from batched_nuts import ess, split_rhat
+
+rhat = split_rhat(draws.position[dataset == 0])  # same as diag.rhat
+tail = ess(draws.position[dataset == 0], kind="tail")  # the tails rather than the bulk
+```
+
+R-hat compares the variance between chains with the variance within them after cutting
+every chain in half, on draws replaced by the normal scores of their ranks. The ranks make
+the number independent of any monotone transformation of the target and keep one heavy tail
+from hiding a chain that has not mixed, which the variance-based R-hat cannot do. A
+coordinate whose draws do not vary is reported as `nan`. The effective sizes follow Geyer's
+initial positive sequence on the same split chains: the autocorrelations are summed in pairs
+until the first pair that is not positive, after making the sequence decrease monotonically.
+Both are the estimates of Vehtari, Gelman, Simpson, Carpenter and Bürkner (2021); they agree
+with ArviZ to within about a percent on chains of a thousand draws and more. Short chains
+differ slightly, because where the autocorrelation sequence is truncated is a choice the
+estimator makes.
+
+The thresholds are the caller's. `diag.converged(max_rhat=1.05, min_ess=50)` suits a target
+where a hundred effective draws per coordinate is more than the budget allows. A divergence
+is not part of the result: it is reported per transition by `draws.is_divergent`.
+
 ## What you provide, and what the package leaves out
 
 - **Step size and mass matrix.** Every chain has a fixed step size and a fixed diagonal
@@ -463,6 +508,7 @@ python benchmarks/benchmark.py
 ## How it works
 
 The sampling loop is in `src/batched_nuts/nuts.py`. The per-lane adaptation is in `warmup.py`.
+The convergence diagnostics of the draws are in `diagnostics.py`.
 
 - `_step` advances one lane by one leapfrog step and does the bookkeeping of NUTS for
   it without any Python control flow, so that `jax.vmap` turns it into the step of all
@@ -486,6 +532,10 @@ The sampling loop is in `src/batched_nuts/nuts.py`. The per-lane adaptation is i
   ([arXiv:1910.11141](https://arxiv.org/abs/1910.11141)), solve the same problem for
   NUTS in general: a compiler transformation that tracks a program point for every
   member of a batch. This package does it by hand for one algorithm.
+- A. Vehtari, A. Gelman, D. Simpson, B. Carpenter and P.-C. Bürkner,
+  "Rank-normalization, folding, and localization: An improved R̂ for assessing
+  convergence of MCMC", Bayesian Analysis 16, 2021, for the R̂ and the effective sizes
+  that `summary` reports.
 
 ## Pooled draws during a run
 
