@@ -426,6 +426,36 @@ Summary callbacks carry scalars per lane. Requesting moments additionally
 uses per-lane storage proportional to the parameter dimension and transfers
 only closing window rows, in bounded groups. The sampler retains no event history.
 
+### Inspect the stream before sampling
+
+`lower_sample_batches` accepts the same density, jobs and keyword arguments as
+`sample_batches`. It traces startup and the first round loop on abstract sampler
+state. You can inspect the compiler input or compile either stage without running
+a chain or allocating its trajectory and draw buffers.
+
+```python
+from batched_nuts import AdaptiveWindows, lower_sample_batches
+
+plans = lower_sample_batches(logdensity, jobs, schedule=AdaptiveWindows(),
+                             buffer_size=1024, max_rounds=50_000)
+for stage, program in plans._asdict().items():
+    memory = program.compile().memory_analysis()
+    if memory is not None:
+        print(stage, "planned peak bytes", memory.peak_memory_in_bytes)
+```
+
+`plans.startup` initializes the chains. With a warmup schedule, `plans.round`
+advances warming and sampling chains together. With fitted jobs it advances
+sampling alone. Each is a JAX `Lowered` object with `as_text()` for inspection.
+With scheduled warmup, passing `on_warmup` selects the event-producing program.
+Inspection never calls the callback. At `max_rounds=0` the stream needs neither
+program and the function returns `None`. Memory analysis depends on the compiler
+and backend. Its byte counts
+describe the compiler's plan. Measuring physical device residency requires
+observing a running process. When JAX automatically partitions a dataset across a
+device mesh, inspection compiles startup to obtain the layouts for the round
+loop. The sampler still runs only when you advance `sample_batches`.
+
 ## License
 
 MIT

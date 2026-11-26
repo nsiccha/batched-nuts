@@ -455,9 +455,19 @@ def _empty_lanes(num_lanes, dim, dtype, max_depth, data, metric=None):
         if isinstance(metric, MetricFactor)
         else vector
     )
-    chain = Chain(index, key, scalar, initial_metric, jax.tree.map(lambda x: x[0], data))
+    chain = Chain(index, key, scalar, initial_metric, None)
+    chains = _repeat(chain, num_lanes)._replace(data=_chain_data(data, num_lanes))
+    return _repeat(lane, num_lanes), chains
 
-    return _repeat(lane, num_lanes), _repeat(chain, num_lanes)
+
+@partial(jax.jit, static_argnums=1)
+def _broadcast_data(row, width):
+    return jnp.broadcast_to(row, (width,) + jnp.shape(row))
+
+
+def _chain_data(data, width, broadcast=_broadcast_data):
+    # Slice host datasets before creating their per-lane device buffers.
+    return jax.tree.map(lambda x: broadcast(x[0], width), data)
 
 
 def _repeat(tree, n):

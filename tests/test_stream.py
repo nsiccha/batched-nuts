@@ -1,3 +1,5 @@
+from inspect import signature
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,7 +10,9 @@ from batched_nuts import (
     DiagonalAdaptation,
     FixedWindows,
     Jobs,
+    MetricFactor,
     StructuredAdaptation,
+    lower_sample_batches,
     sample,
     sample_batches,
     warmup,
@@ -354,3 +358,151 @@ def test_summary_and_evidence_availability_for_other_warmup_policies(structured)
     for e in events:
         assert e.evidence_requested
         assert e.evidence_source is e.stability_range is e.evidence is None
+
+
+@pytest.mark.parametrize(
+    "mode,dtype,capacity",
+    [
+        ("fitted", np.float32, 7),
+        ("diagonal", np.float64, None),
+        ("structured", np.float64, 8),
+        ("auto_mesh", np.float32, 8),
+        ("events", np.float64, 7),
+    ],
+)
+def test_lower_sample_batches_matches_stream_calls(monkeypatch, mode, dtype, capacity):
+    from batched_nuts import stream
+
+    def target(q, data):
+        return density(q - data["mean"])
+
+    position = np.zeros((2, 4), dtype)
+    metric = np.ones_like(position)
+    options = dict(
+        data={"mean": np.arange(12, dtype=dtype).reshape(3, 4)},
+        buffer_size=capacity,
+        max_depth=2,
+        max_rounds=1,
+    )
+    if mode != "fitted":
+        # A dataset may select a different device from JAX's default.
+        options["data"]["mean"] = jax.device_put(options["data"]["mean"], jax.devices()[-1])
+        options["schedule"] = FixedWindows((4,), 2)
+    callback_events = []
+    if mode == "events":
+        options.update(
+            schedule=AdaptiveWindows(first_window=4, max_windows=2, final_window=2),
+            on_warmup=callback_events.extend,
+            include_window_evidence=True,
+        )
+    if mode in ("structured", "auto_mesh"):
+        automatic = mode == "auto_mesh"
+        axis = jax.sharding.AxisType.Auto if automatic else jax.sharding.AxisType.Explicit
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ("batch",), (axis,))
+        spec = (
+            jax.sharding.PartitionSpec(None, "batch")
+            if automatic
+            else jax.sharding.PartitionSpec()
+        )
+        placement = jax.sharding.NamedSharding(mesh, spec)
+        options["data"]["mean"] = jax.device_put(options["data"]["mean"], placement)
+    if mode == "structured":
+        metric = MetricFactor.from_low_rank(
+            metric, np.ones((2, 4, 1)) * 0.1, np.ones((2, 1, 1))
+        )
+    jobs = Jobs(
+        jax.random.split(jax.random.key(0), 2),
+        position,
+        np.full(2, 0.2, dtype),
+        metric,
+        dataset=np.array([2, 0]),
+    )
+
+    calls = {}
+
+    def capture(stage, kernel):
+        class Observed:
+            trace = kernel.trace
+            lower = kernel.lower
+
+            def __call__(self, *args):
+                calls[stage] = kernel.lower(*args)
+                return kernel(*args)
+
+        return Observed()
+
+    if mode == "fitted":
+        compiled = stream._compiled
+
+        def fitted(*args):
+            refill, loop = compiled(*args)
+            return capture("startup", refill), capture("round", loop)
+
+        monkeypatch.setattr(stream, "_compiled", fitted)
+    else:
+        compiled, mixed = stream._compiled_warmup, stream._mixed_loop
+
+        def warmup_kernels(*args):
+            refill, warm = compiled(*args)
+            return capture("startup", refill), warm
+
+        monkeypatch.setattr(stream, "_compiled_warmup", warmup_kernels)
+        monkeypatch.setattr(
+            stream, "_mixed_loop", lambda *args: capture("round", mixed(*args))
+        )
+
+    with monkeypatch.context() as check:
+        empty = stream._empty
+
+        def abstract_buffers(*args):
+            state, chains = empty(*args)
+            assert isinstance(state.records.position, jax.core.Tracer)
+            return state, chains
+
+        check.setattr(stream, "_empty", abstract_buffers)
+        plans = lower_sample_batches(target, jobs, **options)
+    batches = sample_batches(target, jobs, **options)
+    assert not calls
+    assert not callback_events
+    assert next(batches).num_rounds == 1
+    assert calls.keys() == plans._asdict().keys()
+    for name, planned in plans._asdict().items():
+        actual = calls[name]
+        assert planned.as_text() == actual.as_text()
+        assert planned.donate_argnums == actual.donate_argnums
+        planned_exe, actual_exe = planned.compile(), actual.compile()
+        assert planned_exe.output_shardings == actual_exe.output_shardings
+        planned_memory = planned_exe.memory_analysis()
+        actual_memory = actual_exe.memory_analysis()
+        if actual_memory is None:
+            assert planned_memory is None
+            continue
+        for field in (
+            "argument_size_in_bytes",
+            "output_size_in_bytes",
+            "alias_size_in_bytes",
+            "temp_size_in_bytes",
+            "peak_memory_in_bytes",
+        ):
+            assert getattr(planned_memory, field) == getattr(actual_memory, field)
+
+
+def test_lower_sample_batches_empty_budget_and_validation():
+    assert (
+        signature(lower_sample_batches).parameters == signature(sample_batches).parameters
+    )
+    jobs = Jobs(
+        jax.random.split(jax.random.key(0), 1),
+        np.zeros((1, 2)),
+        np.ones(1),
+        np.ones((1, 2)),
+    )
+
+    def unused(_):
+        pytest.fail("A zero-budget stream has no density to trace")
+
+    assert lower_sample_batches(unused, jobs, max_rounds=0) is None
+    assert list(sample_batches(unused, jobs, max_rounds=0)) == []
+    for call in (lower_sample_batches, lambda *a, **kw: list(sample_batches(*a, **kw))):
+        with pytest.raises(ValueError, match="buffer"):
+            call(unused, jobs, buffer_size=0, max_rounds=0)

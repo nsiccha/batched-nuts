@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+Added `lower_sample_batches` to inspect the compiler plans for stream startup and
+the first round loop before running a chain.
+
 ## 0.1.5
 
 `sample_batches` accepts an optional warmup callback for per-chain window closures,

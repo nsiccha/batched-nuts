@@ -12,6 +12,8 @@ import numpy as np
 from batched_nuts.nuts import (
     Jobs,
     Record,
+    _broadcast_data,
+    _chain_data,
     _compiled,
     _empty,
     _prepare_queue,
@@ -34,6 +36,13 @@ class DrawBatch(NamedTuple):
     num_rounds: int
     completion_rounds: np.ndarray
     failed_jobs: np.ndarray
+
+
+class LoweredStream(NamedTuple):
+    """JAX programs for startup and the first round loop of a draw stream."""
+
+    startup: jax.stages.Lowered
+    round: jax.stages.Lowered
 
 
 class WindowEvidence(NamedTuple):
@@ -273,6 +282,92 @@ def sample_batches(
     event round, before yielding draws from that round. Set include_window_evidence
     to also receive moments from completed adaptive diagonal metric windows.
     """
+    yield from _prepare_stream(
+        logdensity,
+        jobs,
+        data,
+        schedule,
+        diagonal,
+        structured,
+        acceptance,
+        restart_dual,
+        target_acceptance,
+        max_depth,
+        buffer_size,
+        max_rounds,
+        rounds_per_batch,
+        on_warmup,
+        include_window_evidence,
+        lower=False,
+    )
+
+
+def lower_sample_batches(
+    logdensity,
+    jobs: Jobs,
+    *,
+    data=None,
+    schedule=None,
+    diagonal=None,
+    structured=None,
+    acceptance="mean",
+    restart_dual=True,
+    target_acceptance=0.8,
+    max_depth=10,
+    buffer_size=None,
+    max_rounds=None,
+    rounds_per_batch=None,
+    on_warmup: Callable[[tuple[WarmupEvent, ...]], None] | None = None,
+    include_window_evidence=False,
+) -> LoweredStream | None:
+    """Lower the startup and first round loop that sample_batches would execute.
+
+    Accepts the same jobs, data and settings as sample_batches. Returns None for
+    max_rounds=0. Otherwise each stage can be inspected or compiled separately.
+    Lowering traces the density on abstract inputs without advancing a chain or
+    allocating the device buffers for its trajectories and draws. With an
+    automatically partitioned dataset, lowering compiles startup to determine
+    the output layouts that the round loop will receive.
+    """
+    return _prepare_stream(
+        logdensity,
+        jobs,
+        data,
+        schedule,
+        diagonal,
+        structured,
+        acceptance,
+        restart_dual,
+        target_acceptance,
+        max_depth,
+        buffer_size,
+        max_rounds,
+        rounds_per_batch,
+        on_warmup,
+        include_window_evidence,
+        lower=True,
+    )
+
+
+def _prepare_stream(
+    logdensity,
+    jobs,
+    data,
+    schedule,
+    diagonal,
+    structured,
+    acceptance,
+    restart_dual,
+    target_acceptance,
+    max_depth,
+    buffer_size,
+    max_rounds,
+    rounds_per_batch,
+    on_warmup,
+    include_window_evidence,
+    *,
+    lower,
+):
     if on_warmup is not None and not callable(on_warmup):
         raise TypeError("on_warmup must be callable.")
     if not isinstance(include_window_evidence, (bool, np.bool_)):
@@ -318,35 +413,81 @@ def sample_batches(
     if size < width:
         raise ValueError("The buffer must hold at least one simultaneous draw per chain.")
     if max_rounds == 0:
-        return
+        return None if lower else iter(())
+
     dtype = queue.position.dtype
-    state, chains = _empty(width, dim, dtype, max_depth, size, data, queue.inverse_mass)
+
+    def buffers(data, metric):
+        state, chains = _empty(width, dim, dtype, max_depth, size, data, metric)
+        stats = None
+        if schedule is not None:
+            stats = jax.vmap(partial(_initial, n_windows=len(lengths), policy=policy))(
+                state.lanes.proposal.position,
+                state.lanes.proposal.grad,
+                chains.step_size,
+                chains.inverse_mass,
+            )
+        return state, chains, stats
+
+    if lower:
+        state, chains, stats = jax.eval_shape(buffers, None, queue.inverse_mass)
+
+        def abstract_data(row, width):
+            traced = _broadcast_data.trace(row, width)
+            return _output_shapes(traced, _committed_sharding(row))
+
+        chains = chains._replace(data=_chain_data(data, width, abstract_data))
+    else:
+        state, chains, stats = buffers(data, queue.inverse_mass)
+
     take, ids = np.ones(width, bool), np.arange(width, dtype=np.int32)
     refill, loop = _compiled(target, max_depth)
-    stats = None
     if schedule is None:
-        state, chains = refill(state, chains, take, ids, queue, data)
+        inputs = (state, chains, take, ids, queue, data)
     else:
-        budgets = jnp.asarray(lengths, jnp.int32)
-        accept = jnp.asarray(target_acceptance, dtype)
-        stats = jax.vmap(partial(_initial, n_windows=len(lengths), policy=policy))(
-            state.lanes.proposal.position,
-            state.lanes.proposal.grad,
-            chains.step_size,
-            chains.inverse_mass,
-        )
-        init, _ = _compiled_warmup(
+        refill, _ = _compiled_warmup(
             target, max_depth, policy, schedule, acceptance, restart_dual
         )
-        lanes, chains, stats, sampling_keys, valid = init(
-            state.lanes, chains, stats, take, ids, queue, data
+        inputs = (state.lanes, chains, stats, take, ids, queue, data)
+
+    if lower:
+        traced = refill.trace(*inputs)
+        startup = traced.lower()
+        # An actual refill inherits its dataset's devices. JAX's trace carries
+        # the output partition specs but can omit the concrete device assignment.
+        placement = next(
+            (
+                x.sharding
+                for x in jax.tree.leaves(data)
+                if _committed_sharding(x) is not None
+            ),
+            None,
         )
-        if not np.asarray(valid).all():
+        outputs = _output_shapes(traced, placement, startup)
+    else:
+        outputs = refill(*inputs)
+
+    del inputs
+    deliver_events = None
+    if schedule is None:
+        state, chains = outputs
+        step = loop
+        round_args = (None, False)  # No draw quota or waiting jobs.
+        n_windows = 0
+    else:
+        lanes, chains, stats, sampling_keys, valid = outputs
+        if not lower and not np.asarray(valid).all():
             raise ValueError("Nonfinite initial log density or gradient.")
         state = state._replace(lanes=lanes)
-        del lanes
-        keys = jax.random.wrap_key_data(sampling_keys)
-        mixed = _mixed_loop(
+        wrap_keys = jax.random.wrap_key_data
+        keys = (
+            _output_shapes(jax.jit(wrap_keys).trace(sampling_keys), sampling_keys.sharding)
+            if lower
+            else wrap_keys(sampling_keys)
+        )
+        budgets = jnp.asarray(lengths, jnp.int32)
+        round_args = (stats, keys, budgets, jnp.asarray(target_acceptance, dtype))
+        step = _mixed_loop(
             target,
             max_depth,
             policy,
@@ -356,6 +497,80 @@ def sample_batches(
             on_warmup is not None,
             include_window_evidence,
         )
+        n_windows = len(lengths)
+        if on_warmup is not None:
+            deliver_events = partial(
+                _deliver_events,
+                on_warmup,
+                last=n_windows - 1,
+                schedule=schedule,
+                policy=policy,
+                window_evidence=include_window_evidence,
+            )
+
+    if lower:
+        limit = _round_limit(0, max_rounds, rounds_per_batch)
+        return LoweredStream(startup, step.lower(state, chains, *round_args, limit, True))
+    return _round_batches(
+        state,
+        chains,
+        step,
+        round_args,
+        loop,
+        n_windows,
+        max_rounds,
+        rounds_per_batch,
+        deliver_events,
+    )
+
+
+def _committed_sharding(array):
+    return array.sharding if isinstance(array, jax.Array) and array.committed else None
+
+
+def _output_shapes(traced, placement, lowered=None):
+    shapes = traced.out_info
+    if placement is None:
+        return shapes
+    if isinstance(placement, jax.sharding.NamedSharding):
+        if placement.mesh.auto_axes:
+            # With automatic partitioning the compiler chooses output layouts.
+            # Query the executable for them without passing it any buffers.
+            lowered = traced.lower() if lowered is None else lowered
+            formats = lowered.compile().output_formats
+            return jax.tree.map(
+                lambda shape, fmt: shape.update(sharding=fmt), shapes, formats
+            )
+
+        def place(shape):
+            spec = getattr(shape.sharding, "spec", jax.sharding.PartitionSpec())
+            return shape.update(sharding=placement.update(spec=spec))
+
+        return jax.tree.map(place, shapes)
+    return jax.tree.map(lambda shape: shape.update(sharding=placement), shapes)
+
+
+def _round_limit(rounds, max_rounds, rounds_per_batch):
+    limit = np.iinfo(np.int32).max
+    if max_rounds is not None:
+        limit = min(limit, max_rounds - rounds)
+    if rounds_per_batch is not None:
+        limit = min(limit, rounds_per_batch - rounds % rounds_per_batch)
+    return jnp.int32(limit)
+
+
+def _round_batches(
+    state,
+    chains,
+    step,
+    round_args,
+    loop,
+    n_windows,
+    max_rounds,
+    rounds_per_batch,
+    deliver_events,
+):
+    width = state.lanes.active.size
     first = True
     rounds = 0
     progress = np.zeros(width, np.int64)
@@ -363,47 +578,36 @@ def sample_batches(
     failed = np.zeros(width, bool)
     while max_rounds is None or rounds < max_rounds:
         new_failures = np.empty(0, dtype=np.intp)
-        limit = np.iinfo(np.int32).max
-        if max_rounds is not None:
-            limit = min(limit, max_rounds - rounds)
-        if rounds_per_batch is not None:
-            limit = min(limit, rounds_per_batch - rounds % rounds_per_batch)
-        if stats is None:
-            state = loop(state, chains, None, False, jnp.int32(limit), first)
+        limit = _round_limit(rounds, max_rounds, rounds_per_batch)
+        result = step(state, chains, *round_args, limit, first)
+        if step is loop:
+            state = result
+            del result
             rounds += int(state.num_iterations)
         else:
-            state, chains, stats, *diagnostics = mixed(
-                state, chains, stats, keys, budgets, accept, jnp.int32(limit), first
-            )
+            state, chains, stats, *diagnostics = result
+            del result
             rounds += int(state.num_iterations)
+            round_args = (stats, *round_args[1:])
             current_failures = np.asarray(stats.failed)
             new_failures = np.flatnonzero(current_failures & ~failed)
             failed = current_failures
-            ready = np.asarray(stats.phase) >= len(lengths)
+            ready = np.asarray(stats.phase) >= n_windows
             newly_ready = ready & ~frozen
             if np.any(newly_ready):
                 progress[newly_ready] = np.asarray(stats.evaluations)[newly_ready].sum(
                     axis=1, dtype=np.int64
                 )
                 frozen = ready
-            if on_warmup is not None:
+            if deliver_events is not None:
                 events, resume = diagnostics
-                _deliver_events(
-                    on_warmup,
-                    events,
-                    rounds,
-                    failed,
-                    len(lengths) - 1,
-                    schedule,
-                    policy,
-                    include_window_evidence,
-                )
+                deliver_events(events, rounds, failed)
                 del events, diagnostics
                 if bool(resume):
                     continue
             if (ready | failed).all():
-                stats = None
-                del keys, sampling_keys
+                step, round_args = loop, (None, False)
+            del stats
         count = int(state.num_records)
         if (
             count

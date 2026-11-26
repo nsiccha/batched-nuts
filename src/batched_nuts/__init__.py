@@ -8,7 +8,14 @@ from batched_nuts.policy import (
     FixedWindows,
     StructuredAdaptation,
 )
-from batched_nuts.stream import DrawBatch, WarmupEvent, WindowEvidence, sample_batches
+from batched_nuts.stream import (
+    DrawBatch,
+    LoweredStream,
+    WarmupEvent,
+    WindowEvidence,
+    lower_sample_batches,
+    sample_batches,
+)
 from batched_nuts.warmup import WarmupResult, warmup
 
 __all__ = [
@@ -18,11 +25,13 @@ __all__ = [
     "DrawBatch",
     "Draws",
     "Jobs",
+    "LoweredStream",
     "MetricFactor",
     "StructuredAdaptation",
     "WarmupEvent",
     "WarmupResult",
     "WindowEvidence",
+    "lower_sample_batches",
     "sample",
     "sample_batches",
     "warmup",
