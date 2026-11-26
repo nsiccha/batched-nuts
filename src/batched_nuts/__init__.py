@@ -1,6 +1,7 @@
 """NUTS for many chains at once in JAX, batched by gradient evaluation."""
 
 from batched_nuts.branching import Branch, Branching, BranchOrigin, Parent
+from batched_nuts.grouped import GroupedDensity, GroupFactor
 from batched_nuts.hierarchical import HierarchicalStart, hierarchical_start
 from batched_nuts.metric import MetricFactor
 from batched_nuts.nuts import Draws, Jobs, sample
@@ -32,6 +33,8 @@ __all__ = [
     "FixedWindows",
     "DrawBatch",
     "Draws",
+    "GroupFactor",
+    "GroupedDensity",
     "HierarchicalStart",
     "Jobs",
     "LoweredStream",

@@ -276,10 +276,7 @@ The starts also do not depend on whether the effects are written centered or sca
 When the effects are conditionally normal, the marginal density and the conditional
 draws are exact. Otherwise both are Laplace approximations.
 
-What it does not cover:
-
-- **Two or more grouping factors.** Crossed or nested effects are not independent
-  given the population values.
+The one-factor fit assumes independent groups given the population parameters.
 - **Many population-level parameters.** The fit takes one directional derivative of
   the marginal per parameter.
 - **Parameters with their own scale.** Only a parameter whose prior does not depend on
@@ -296,6 +293,58 @@ conditional mode. Fits that do not converge are left out. Converged fits that en
 different points produce a warning, and the one with the highest marginal density is
 used. Enable 64-bit floats in JAX before calling.
 
+### Two crossed or nested grouping factors
+
+A response may involve a level from each of two factors, for example a person and an
+item, or a cask and its enclosing batch. Pass two ordered `GroupFactor` objects.
+Each contains a table of unconstrained coordinate indices, one row per level, and
+an integer vector giving the zero-based level of each observation. Allocate separate
+level IDs for subgroups belonging to different parents. Population coordinates and
+both tables must cover the flat position exactly once.
+
+For example, these observations have a shared intercept, person and item effects
+with known normal priors, and unit observation noise:
+
+```python
+from batched_nuts import GroupedDensity, GroupFactor, hierarchical_start
+
+person = np.array([0, 1, 0, 2, 2])
+item = np.array([0, 0, 1, 1, 1])
+response = jnp.array([1.0, -0.1, 0.8, 0.2, 0.3])
+groups = [
+    GroupFactor(np.array([[1], [2], [3]]), person),
+    GroupFactor(np.array([[4], [5]]), item),
+]
+model = GroupedDensity(
+    population=lambda h, d: -0.5 * h[0] ** 2,
+    normal=lambda h, d: ((0.0, 1.0), (0.0, 0.5)),
+    observation=lambda h, a, b, i, d: -0.5 * (d[i] - h[0] - a[0] - b[0]) ** 2,
+    quadratic=True,
+)
+start = hierarchical_start(model, [0], groups, 128, jax.random.key(0), data=response)
+```
+
+The population callback supplies the log density of the population parameters in
+their unconstrained coordinates, including any transformation Jacobian. The normal
+callback returns a location and positive standard deviation for each coordinate
+of each factor, broadcastable to its table. Given the population values, these
+priors are independent. The observation callback returns one row’s log likelihood,
+including its scale-dependent normalization. Use the matching full joint log
+density when running NUTS.
+
+The first factor is integrated independently by level. Set `quadratic=True` only
+when every observation log likelihood is jointly quadratic in the two effects at
+fixed population values. Otherwise the first effect must be scalar and its
+observation log likelihood concave in that effect. The algorithm integrates it
+by numerical quadrature, fits a conditional Gaussian to the second factor, and
+adjusts its mean using directional third derivatives. Nested effects use separate
+curvature blocks. Crossed effects use sparse observation-to-level coupling, with
+a bounded determinant approximation when more than eight singular directions
+contribute. The returned diagonal inverse mass is estimated from the generated
+ensemble, using at least 16 draws. This path uses CPU-side sparse algebra and one
+population fit starts at zero by default. A single `GroupFactor` in a list accepts
+the ordinary joint log density and uses the original one-factor algorithm.
+
 ## What you provide, and what the package leaves out
 
 - **Step size and mass matrix.** Every chain has a fixed step size and a fixed diagonal
@@ -303,8 +352,7 @@ used. Enable 64-bit floats in JAX before calling.
   by `warmup`. The benchmark uses `blackjax.window_adaptation` for its common start.
 - **Positions are vectors.** Flatten a structured position yourself, for example with
   `jax.flatten_util.ravel_pytree`.
-- **Starting positions.** Supply them in `Jobs`. For a hierarchical model with one
-  grouping factor, `hierarchical_start` computes them together with an inverse mass.
+- **Starting positions.** Supply them in `Jobs`. For supported hierarchical models, `hierarchical_start` computes them together with an inverse mass.
 - **Keys.** Transition `t` of a chain uses the key `jax.random.fold_in(key, t)` exactly
   as `blackjax.nuts(...).step` would use it.
 - **Memory.** The device holds the state of the lanes and a buffer for finished

@@ -15,6 +15,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from batched_nuts.grouped import GroupFactor, factor_indices, grouped_start
+
 
 class HierarchicalStart(NamedTuple):
     """The result of `hierarchical_start`."""
@@ -25,7 +27,7 @@ class HierarchicalStart(NamedTuple):
     covariance: np.ndarray  # (num_population, num_population) their covariance
     num_converged: int  # how many of the fits converged
     num_agreeing: int  # how many of those ended at the chosen fit
-    num_steps: np.ndarray  # (num_fits,) Newton steps each fit took
+    num_steps: np.ndarray  # (num_fits,) optimizer steps each fit took
 
 
 def _floor(eigenvalues, damping):
@@ -323,7 +325,10 @@ def hierarchical_start(
     groups
         Integer coordinates of the effects, shape (num_groups, effects_per_group).  Row
         `j` holds the effects of group `j`.  Together with `population` it must name
-        every coordinate exactly once.
+        every coordinate exactly once. Alternatively pass an ordered sequence of one
+        or two GroupFactor declarations. For two, supply a GroupedDensity with
+        population, normal-prior and observation callbacks. The first factor is
+        integrated before the second. See the README for supported models.
     num_chains
         How many starting positions to draw.
     key
@@ -334,7 +339,8 @@ def hierarchical_start(
         The fit is repeated from this many starting values and the results are compared.
     initial
         Starting values of the population-level parameters, shape
-        (num_fits, num_population).  By default uniform on (-2, 2).
+        (num_fits, num_population). By default uniform on (-2, 2), with the first
+        fit started at zero on the two-factor path.
     num_sweeps
         Slice-sampling updates of each chain's population values on the fitted marginal,
         one per coordinate and sweep.  0 keeps the draw from the normal distribution.
@@ -356,6 +362,10 @@ def hierarchical_start(
 
     Notes
     -----
+    For two factors, the inverse mass is estimated from at least 16 reconstructed
+    draws and the small population Hessian uses finite differences. The following
+    describes the one-factor implementation.
+
     For fixed population values, the effects of all groups are moved to their conditional
     mode by Newton steps on one small block per group.  The blocks come from
     `effects_per_group` Hessian-vector products of the joint density.  Laplace's formula
@@ -380,6 +390,27 @@ def hierarchical_start(
     The search for the conditional modes starts from zero effects.  Enable 64-bit floats
     in JAX before calling: the stopping tests assume them.
     """
+    if isinstance(groups, (tuple, list)) and any(
+        isinstance(f, GroupFactor) for f in groups
+    ):
+        if not all(isinstance(f, GroupFactor) for f in groups):
+            raise ValueError("each ordered factor must be a GroupFactor")
+        if len(groups) == 1:
+            tables, _ = factor_indices(population, groups)
+            groups = tables[0]
+        else:
+            return grouped_start(
+                logdensity,
+                population,
+                groups,
+                num_chains,
+                key,
+                data,
+                num_fits,
+                initial,
+                num_sweeps,
+                max_steps,
+            )
     population = np.asarray(population)
     groups = np.asarray(groups)
     if population.ndim != 1 or groups.ndim != 2:

@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "batched-nuts"
-version = "0.1.8"
+version = "0.1.9"
 description = "NUTS for many chains at once in JAX, batched by gradient evaluation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = ["jax>=0.12", "numpy>=2"]
+dependencies = ["jax>=0.12", "numpy>=2", "scipy>=1.13"]
 
 [project.optional-dependencies]
-test = ["pytest", "blackjax>=1.7.1", "scipy"]
+test = ["pytest", "blackjax>=1.7.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/batched_nuts"]

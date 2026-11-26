@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.9
+
+`hierarchical_start` accepts two ordered `GroupFactor` declarations with a
+`GroupedDensity` for crossed or nested normal random effects. The first
+factor is integrated by level, then the second is reconstructed using the
+curvature of its marginal. Population fits, chain positions and a diagonal
+inverse mass are returned through the existing interface.
+
 ## 0.1.8
 
 Added `hierarchical_start` for models with population-level parameters and a few
