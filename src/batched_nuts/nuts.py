@@ -18,6 +18,7 @@ written in the same order, so the same key gives the same trajectory and the sam
 
 from collections.abc import Callable
 from functools import lru_cache, partial
+from operator import index
 from typing import Any, NamedTuple
 
 import jax
@@ -25,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from batched_nuts.metric import MetricFactor, _apply, _momentum, _validate_factor, _velocity
+from batched_nuts.policy import _positive
 
 DIVERGENCE_THRESHOLD = 1000
 
@@ -496,8 +498,12 @@ def _prepare_queue(logdensity, jobs, data):
     position = np.asarray(jobs.position)
     if not np.issubdtype(position.dtype, np.floating):
         raise TypeError("`jobs.position` must be a floating point array.")
+    if position.ndim != 2:
+        raise ValueError(
+            f"`jobs.position` must have shape (num_chains, dim), got {position.shape}."
+        )
     dtype = position.dtype
-    num_jobs = len(position)
+    num_jobs, dim = position.shape
     if data is None:
         logdensity = _without_data(logdensity)
         dataset = np.zeros(num_jobs, np.int32)
@@ -517,6 +523,11 @@ def _prepare_queue(logdensity, jobs, data):
         ),
         dataset=dataset,
     )
+    for name, shape in (("step_size", (num_jobs,)), ("inverse_mass", position.shape)):
+        if name == "inverse_mass" and isinstance(queue.inverse_mass, MetricFactor):
+            continue
+        if getattr(queue, name).shape != shape:
+            raise ValueError(f"jobs.{name} must have shape {shape}.")
     return logdensity, queue
 
 
@@ -566,9 +577,23 @@ def sample(
         How many finished transitions the batched loop may hold before it hands them to
         host memory.  The draws are returned as NumPy arrays and never accumulate on the
         device.  The default is `max(1024, 4 * num_lanes)`.
+
+    Raises
+    ------
+    ValueError
+        If `num_draws`, `num_lanes` or `buffer_size` is not positive, if `max_depth`
+        is not between 1 and 30, or if `jobs` holds no chain or no coordinate.
     """
+    num_draws = _positive(num_draws, "num_draws")
+    max_depth = index(max_depth)
+    if not 1 <= max_depth <= 30:
+        raise ValueError("max_depth must be between 1 and 30.")
+    num_lanes = None if num_lanes is None else _positive(num_lanes, "num_lanes")
+    buffer_size = None if buffer_size is None else _positive(buffer_size, "buffer_size")
     logdensity, queue = _prepare_queue(logdensity, jobs, data)
     num_jobs, dim = queue.position.shape
+    if min(num_jobs, dim) < 1:
+        raise ValueError("Sampling requires a chain and a coordinate.")
     dtype = queue.position.dtype
     num_lanes = num_jobs if num_lanes is None else min(num_lanes, num_jobs)
     buffer_size = max(1024, 4 * num_lanes) if buffer_size is None else buffer_size
