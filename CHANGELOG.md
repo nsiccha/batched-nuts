@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+`sample_batches` accepts an optional warmup callback for per-chain window closures,
+divergences, freezes and failures at their exact rounds. Adaptive diagonal windows
+report the stopping statistic and can include the moments used to compute it.
+
 ## 0.1.4
 
 Added compact per-chain factors for fixed sampling and windowed warmup. Structured

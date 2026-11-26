@@ -1,6 +1,6 @@
 """Stream completed draws while every chain continues to advance."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from functools import lru_cache, partial
 from operator import index
 from typing import NamedTuple
@@ -17,7 +17,14 @@ from batched_nuts.nuts import (
     _prepare_queue,
     _write_records,
 )
-from batched_nuts.warmup import _compiled_warmup, _initial, _prepare_warmup, _warm_step
+from batched_nuts.policy import AdaptiveWindows, DiagonalAdaptation
+from batched_nuts.warmup import (
+    _compiled_warmup,
+    _initial,
+    _prepare_warmup,
+    _StepEvents,
+    _warm_step,
+)
 
 
 class DrawBatch(NamedTuple):
@@ -29,10 +36,51 @@ class DrawBatch(NamedTuple):
     failed_jobs: np.ndarray
 
 
+class WindowEvidence(NamedTuple):
+    """Moments and weight from the stopping monitor's just-closed diagonal window."""
+
+    weight: int
+    position_mean: np.ndarray
+    position_variance: np.ndarray
+    gradient_mean: np.ndarray
+    gradient_variance: np.ndarray
+
+
+class WarmupEvent(NamedTuple):
+    """One chain at one event round. Counts include this transition in this window."""
+
+    job: int
+    round: int
+    window: int
+    window_closed: bool
+    divergent: bool
+    frozen: bool
+    failed: bool
+    num_evaluations: int
+    num_transitions: int
+    num_divergences: int
+    stable: bool | None
+    stability_range: float | None
+    evidence_source: str | None
+    evidence_requested: bool
+    evidence: WindowEvidence | None
+
+
 @lru_cache(maxsize=16)
-def _mixed_loop(target, max_depth, policy, schedule, acceptance, restart_dual):
+def _mixed_loop(
+    target,
+    max_depth,
+    policy,
+    schedule,
+    acceptance,
+    restart_dual,
+    observe=False,
+    window_evidence=False,
+):
     def run(state, chains, stats, keys, budgets, target_accept, limit, first):
-        state = state._replace(num_records=jnp.int32(0), num_iterations=jnp.int32(0))
+        state = state._replace(num_iterations=jnp.int32(0))
+        if not observe:
+            state = state._replace(num_records=jnp.int32(0))
         step = partial(
             _warm_step,
             target,
@@ -44,13 +92,15 @@ def _mixed_loop(target, max_depth, policy, schedule, acceptance, restart_dual):
             budgets,
             target_accept,
             stream=True,
+            observe=observe,
+            window_evidence=window_evidence,
         )
         width = state.lanes.active.size
         capacity = state.records.job.size
         failed_before = stats.failed
 
         def go_on(carry):
-            state, _, stats = carry
+            state, _, stats, _ = carry
             return (
                 (state.num_iterations < limit)
                 & (state.num_records + width <= capacity)
@@ -60,20 +110,50 @@ def _mixed_loop(target, max_depth, policy, schedule, acceptance, restart_dual):
             )
 
         def advance(carry):
-            state, chains, stats = carry
-            chains, lanes, stats, records, done = jax.vmap(
+            state, chains, stats, _ = carry
+            result = jax.vmap(
                 lambda chain, lane, adapt, key: step(chain, lane, adapt, sampling_key=key),
                 axis_name="lanes",
             )(chains, state.lanes, stats, keys)
+            chains, lanes, stats, records, done = result[:5]
+            events = result[5] if observe else None
             state = state._replace(
                 lanes=lanes,
                 records=_write_records(state, records, done),
                 num_records=state.num_records + jnp.sum(done, dtype=jnp.int32),
                 num_iterations=state.num_iterations + 1,
             )
-            return state, chains, stats
+            return state, chains, stats, events
 
-        return jax.lax.while_loop(go_on, advance, (state, chains, stats))
+        initial = None
+        if observe:
+            diagonal_monitor = isinstance(schedule, AdaptiveWindows) and isinstance(
+                policy, DiagonalAdaptation
+            )
+            clear = jnp.zeros_like(stats.failed)
+            zero = jnp.zeros_like(stats.phase)
+            initial = _StepEvents(
+                clear,
+                clear,
+                zero,
+                zero,
+                zero,
+                zero,
+                clear,
+                jnp.zeros_like(stats.step) if diagonal_monitor else None,
+                stats.fit.window if diagonal_monitor and window_evidence else None,
+            )
+
+        def condition(carry):
+            running = go_on(carry)
+            if observe:
+                events = carry[-1]
+                running &= ~jnp.any(events.closed | events.divergent)
+            return running
+
+        carry = jax.lax.while_loop(condition, advance, (state, chains, stats, initial))
+        # An event-only return leaves buffered draws for their original yield point.
+        return (*carry, go_on(carry)) if observe else carry[:3]
 
     return jax.jit(run, donate_argnums=(0, 1, 2))
 
@@ -86,6 +166,60 @@ def _host_record(column, count):
         # power-of-two shapes so the number of distinct slices stays logarithmic.
         column = column[: 1 << (count - 1).bit_length()]
     return np.asarray(column)[:count].copy()
+
+
+def _host_evidence(evidence, jobs):
+    if evidence is None or not len(jobs):
+        return {}
+    # Gather only closing rows, with power-of-two shapes shared by sparse batches.
+    size = 1 << (len(jobs) - 1).bit_length()
+    indices = np.pad(jobs, (0, size - len(jobs)), mode="edge")
+    gathered = jax.device_get(jax.tree.map(lambda column: column[indices], evidence))
+    result = {}
+    for i, job in enumerate(jobs):
+        position, gradient = np.split(gathered.moments.mean[i], 2)
+        pos_var, grad_var = np.split(gathered.moments.var[i], 2)
+        result[job] = WindowEvidence(
+            int(gathered.weight[i]), position, pos_var, gradient, grad_var
+        )
+    return result
+
+
+def _deliver_events(
+    callback, events, rounds, failed, last, schedule, policy, window_evidence
+):
+    info = jax.device_get(events._replace(evidence=None))
+    jobs = np.flatnonzero(info.closed | info.divergent)
+    adaptive = isinstance(schedule, AdaptiveWindows)
+    source = (schedule.evidence or policy.evidence) if info.span is not None else None
+    for start in range(0, len(jobs), 64):
+        group = jobs[start : start + 64]
+        fitting = info.closed[group] & (info.phase[group] < last)
+        evidence = _host_evidence(events.evidence, group[fitting])
+        batch = []
+        for job, fit in zip(group, fitting, strict=True):
+            phase = int(info.phase[job])
+            compared = adaptive and fit and phase > 0
+            batch.append(
+                WarmupEvent(
+                    job=int(job),
+                    round=rounds,
+                    window=phase,
+                    window_closed=bool(info.closed[job]),
+                    divergent=bool(info.divergent[job]),
+                    frozen=bool(info.closed[job] and phase == last),
+                    failed=bool(failed[job]),
+                    num_evaluations=int(info.evaluations[job]),
+                    num_transitions=int(info.transitions[job]),
+                    num_divergences=int(info.divergences[job]),
+                    stable=bool(info.stable[job]) if compared else None,
+                    stability_range=float(info.span[job]) if source and compared else None,
+                    evidence_source=source if fit else None,
+                    evidence_requested=window_evidence,
+                    evidence=evidence.get(job),
+                )
+            )
+        callback(tuple(batch))
 
 
 def _completion_rounds(record, progress):
@@ -119,6 +253,8 @@ def sample_batches(
     buffer_size=None,
     max_rounds=None,
     rounds_per_batch=None,
+    on_warmup: Callable[[tuple[WarmupEvent, ...]], None] | None = None,
+    include_window_evidence=False,
 ) -> Iterator[DrawBatch]:
     """Run one lane per job. Yield bounded host batches without a per-chain draw quota.
 
@@ -133,7 +269,16 @@ def sample_batches(
     The initial batched evaluation of the starting positions precedes round one.
     If a job exhausts its adaptive windows, its ID is yielded once in failed_jobs.
     Other chains continue. The iterator ends if every job exhausts its windows.
+    If supplied, on_warmup receives tuples of WarmupEvent on the host at each
+    event round, before yielding draws from that round. Set include_window_evidence
+    to also receive moments from completed adaptive diagonal metric windows.
     """
+    if on_warmup is not None and not callable(on_warmup):
+        raise TypeError("on_warmup must be callable.")
+    if not isinstance(include_window_evidence, (bool, np.bool_)):
+        raise TypeError("include_window_evidence must be a boolean.")
+    if include_window_evidence and on_warmup is None:
+        raise ValueError("include_window_evidence requires an on_warmup callback.")
     max_depth = index(max_depth)
     if not 1 <= max_depth <= 30:
         raise ValueError("max_depth must be between 1 and 30.")
@@ -201,7 +346,16 @@ def sample_batches(
         state = state._replace(lanes=lanes)
         del lanes
         keys = jax.random.wrap_key_data(sampling_keys)
-        mixed = _mixed_loop(target, max_depth, policy, schedule, acceptance, restart_dual)
+        mixed = _mixed_loop(
+            target,
+            max_depth,
+            policy,
+            schedule,
+            acceptance,
+            restart_dual,
+            on_warmup is not None,
+            include_window_evidence,
+        )
     first = True
     rounds = 0
     progress = np.zeros(width, np.int64)
@@ -216,10 +370,12 @@ def sample_batches(
             limit = min(limit, rounds_per_batch - rounds % rounds_per_batch)
         if stats is None:
             state = loop(state, chains, None, False, jnp.int32(limit), first)
+            rounds += int(state.num_iterations)
         else:
-            state, chains, stats = mixed(
+            state, chains, stats, *diagnostics = mixed(
                 state, chains, stats, keys, budgets, accept, jnp.int32(limit), first
             )
+            rounds += int(state.num_iterations)
             current_failures = np.asarray(stats.failed)
             new_failures = np.flatnonzero(current_failures & ~failed)
             failed = current_failures
@@ -230,10 +386,24 @@ def sample_batches(
                     axis=1, dtype=np.int64
                 )
                 frozen = ready
+            if on_warmup is not None:
+                events, resume = diagnostics
+                _deliver_events(
+                    on_warmup,
+                    events,
+                    rounds,
+                    failed,
+                    len(lengths) - 1,
+                    schedule,
+                    policy,
+                    include_window_evidence,
+                )
+                del events, diagnostics
+                if bool(resume):
+                    continue
             if (ready | failed).all():
                 stats = None
                 del keys, sampling_keys
-        rounds += int(state.num_iterations)
         count = int(state.num_records)
         if (
             count

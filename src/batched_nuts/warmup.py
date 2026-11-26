@@ -92,6 +92,20 @@ class Evidence(NamedTuple):
     weight: Any
 
 
+class _StepEvents(NamedTuple):
+    """Diagnostics for the most recent leapfrog, one row per lane after batching."""
+
+    closed: Any
+    divergent: Any
+    phase: Any
+    evaluations: Any
+    transitions: Any
+    divergences: Any
+    stable: Any
+    span: Any
+    evidence: Evidence | None
+
+
 def _empty_evidence(point):
     return Evidence(point, jnp.int32(0))
 
@@ -275,15 +289,16 @@ def _update_diagonal(
 
     window, shape = stats.window, stats.last_shape
     stable = jnp.bool_(False)
+    span = evidence = None
     if adaptive:
         # Fit the diagnostic separately on disjoint windows, even if the installed
         # diagonal keeps all its history or uses a different trajectory source.
         window = _observe(window, observations[monitor], policy.variance)
         candidate = _log_diagonal(window.moments.var, policy.estimator)
         change = 0.5 * (candidate - shape)
-        stable = jnp.all(jnp.isfinite(change)) & (
-            jnp.max(change) - jnp.min(change) < jnp.log(schedule.tolerance)
-        )
+        span = jnp.max(change) - jnp.min(change)
+        stable = jnp.all(jnp.isfinite(change)) & (span < jnp.log(schedule.tolerance))
+        evidence = window
         shape = jnp.where(boundary & ~final, candidate, shape)
         window = _where(boundary, empty, window)
 
@@ -332,7 +347,7 @@ def _update_diagonal(
         _where(final, stats.window, window),
         shape,
     )
-    return fit, metric, stable
+    return fit, metric, stable, span, evidence
 
 
 def _warm_step(
@@ -350,6 +365,8 @@ def _warm_step(
     *,
     stream=False,
     sampling_key=None,
+    observe=False,
+    window_evidence=False,
 ):
     chain = chain._replace(step_size=stats.step, inverse_mass=stats.metric)
     lane, rec, ended, sub_done, leaf, prob, delta, take_leaf, take_tree = _advance(
@@ -364,6 +381,7 @@ def _warm_step(
     final_cost = _clock(schedule.final_clock or schedule.clock, evaluations, transitions)
     boundary = ended & (jnp.where(final, final_cost, cost) >= budgets[phase])
     adaptive = isinstance(schedule, AdaptiveWindows)
+    span = evidence = None
     if isinstance(policy, StructuredAdaptation):
         fit, metric, stable = _update_window(
             stats.fit,
@@ -378,7 +396,7 @@ def _warm_step(
         )
         stable &= phase > 0
     else:
-        fit, metric, stable = _update_diagonal(
+        fit, metric, stable, span, evidence = _update_diagonal(
             policy,
             schedule,
             lane,
@@ -436,7 +454,21 @@ def _warm_step(
             draw=jnp.where(ready, 0, lane.draw), active=lane.active & ~failed
         )
         lane = _begin_next(updated, lane, ended, sub_done)
-        return updated, lane, next_stats, rec, keep
+        result = updated, lane, next_stats, rec, keep
+        if observe:
+            event = _StepEvents(
+                warming & boundary,
+                warming & ended & rec.is_divergent,
+                phase,
+                evaluations,
+                transitions,
+                next_stats.divergences[phase],
+                stable,
+                span,
+                evidence if window_evidence else None,
+            )
+            return (*result, event)
+        return result
     updated = chain._replace(step_size=next_stats.step, inverse_mass=metric)
     lane = _begin_next(updated, lane, ended, sub_done)
     return lane._replace(active=lane.active & ~(boundary & final) & ~failed), next_stats

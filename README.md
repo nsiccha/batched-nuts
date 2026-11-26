@@ -375,6 +375,57 @@ If adaptive warmup exhausts its windows for a chain, the batch reports its ID
 in `failed_jobs` once. The remaining chains continue sampling. If every chain
 exhausts its windows, the stream ends after the last failure report.
 
+### Warmup events
+
+Pass a host callback to observe a chain before its first draw. This example
+records when each chain finishes warmup while counting the draws received.
+
+```python
+freeze_rounds = {}
+
+def record_warmup(events):
+    for event in events:
+        if event.frozen:
+            freeze_rounds[event.job] = event.round
+
+draw_count = 0
+for batch in sample_batches(logdensity, jobs, schedule=AdaptiveWindows(),
+                            on_warmup=record_warmup, max_rounds=50_000):
+    draw_count += len(batch.records.job)
+```
+
+The callback receives a tuple of up to 64 `WarmupEvent` records from one
+leapfrog round, in job order. It runs synchronously as the iterator advances,
+before the draw batch for that round is yielded. Callback exceptions propagate
+to the caller. Draw order, batch boundaries and the first draw round are the
+same with diagnostics enabled or disabled. A run with fitted jobs skips warmup.
+
+- `job` and `window` are zero-based. `round` counts leapfrogs from the start
+  of the run. One record covers all events for that job in that round.
+  `divergent` marks a divergent warmup transition, including one before the
+  first window closes. `window_closed` marks the last transition in the window.
+  `frozen` marks completion of final calibration and `failed` marks exhaustion.
+- `num_evaluations`, `num_transitions` and `num_divergences` count work in
+  this window through the event. At an adaptive metric-window close,
+  `stable` gives the stopping decision once a comparison is possible.
+  For a diagonal comparison, `stability_range` gives the actual range compared
+  with `log(schedule.tolerance)`. An attempted nonfinite comparison preserves
+  its nonfinite range and gives `stable=False`. The first window has no previous
+  shape, and fixed windows and final calibration have no stability test. Fields
+  for inapplicable comparisons are `None`.
+- At an adaptive diagonal window close, `evidence_source` names the trajectory
+  evidence used by the stopping monitor. Pass `include_window_evidence=True`
+  to receive its `WindowEvidence` before reset, including the first window.
+  It holds the weight and the coordinatewise means and variances of positions
+  and gradients. Other events have `evidence=None`. Each event records
+  `evidence_requested`; when archiving a run, save the options and last
+  processed round as well, including for runs that produced no events.
+
+The default path allocates no event buffer and transfers no diagnostics.
+Summary callbacks carry scalars per lane. Requesting moments additionally
+uses per-lane storage proportional to the parameter dimension and transfers
+only closing window rows, in bounded groups. The sampler retains no event history.
+
 ## License
 
 MIT
