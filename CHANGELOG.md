@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.8
+
+Added `hierarchical_start` for models with population-level parameters and a few
+effects per group. It fits the population-level parameters on their marginal
+distribution, updates each chain's population values on that marginal by slice
+sampling, draws each group's effects from their conditional distribution, and
+returns starting positions with a diagonal inverse mass for `Jobs`.
+
 ## 0.1.7
 
 Streaming runs can admit children from completed parent draws or saved warmup

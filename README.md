@@ -224,6 +224,78 @@ correlated-Gaussian comparison of time to first draw, pooled effective sample
 size and gradient cost. It uses independent chains to estimate the variance of
 the pooled mean along the long axis of the Gaussian.
 
+## Starts for hierarchical models
+
+For a model with population-level parameters and a few effects per group,
+`hierarchical_start` computes starting positions from the model's structure. You name
+the population-level coordinates and the coordinates of each group's effects:
+
+```python
+start = batched_nuts.hierarchical_start(
+    logdensity,
+    population=population,  # (num_population,) coordinates
+    groups=groups,  # (num_groups, effects_per_group) coordinates
+    num_chains=128,
+    key=jax.random.key(0),
+)
+jobs = batched_nuts.Jobs(
+    key=jax.random.split(jax.random.key(1), 128),
+    position=start.position,
+    step_size=np.full(128, 0.4),
+    inverse_mass=start.inverse_mass,
+)
+fit = batched_nuts.warmup(logdensity, jobs)
+```
+
+The population-level parameters are fitted on their marginal distribution, and each
+group's effects are then drawn from their conditional distribution:
+
+- **Conditional effects.** For fixed population values, the effects of every group move
+  to their conditional mode by Newton steps on one small block per group.
+  `effects_per_group` Hessian-vector products of the joint density give all blocks at
+  once, because groups do not interact once the population values are fixed.
+- **Marginal fit.** Laplace's formula turns those modes and blocks into the marginal
+  density of the population values. A damped Newton method maximizes it with its exact
+  gradient and Hessian. The fit is repeated from `num_fits` starting values;
+  `num_converged` and `num_agreeing` report how many converged and how many of those
+  ended at the chosen point.
+- **Draws.** Each chain's population values start as a draw from the normal
+  distribution at the fit and are then updated on the marginal itself by slice
+  sampling, one whitened coordinate at a time (`num_sweeps=1`). With few groups the
+  marginal of a scale parameter is far from normal, and this update removes most of
+  that error. The chain's effects are drawn from the normal distribution at their
+  conditional mode. `inverse_mass` estimates the variance of the starts per
+  coordinate: the fitted covariance carried through the conditional modes to first
+  order, plus the conditional variance at the fit.
+
+The joint density is never maximized over all coordinates together: the effects only
+move to their conditional mode for given population values. A group scale that
+collapses to zero attracts an optimizer of the joint density; here it plays no role.
+The starts also do not depend on whether the effects are written centered or scaled.
+
+When the effects are conditionally normal, the marginal density and the conditional
+draws are exact. Otherwise both are Laplace approximations.
+
+What it does not cover:
+
+- **Two or more grouping factors.** Crossed or nested effects are not independent
+  given the population values.
+- **Many population-level parameters.** The fit takes one directional derivative of
+  the marginal per parameter.
+- **Parameters with their own scale.** Only a parameter whose prior does not depend on
+  other unknowns is population-level. One that has its own scale parameter is an
+  effect; treated as population-level it sends the fit into a collapsed scale.
+
+The slice update takes a few dozen evaluations of the marginal per chain. With
+thousands of effects it is the largest part of the cost, and with that many groups it
+changes little; `num_sweeps=0` skips it.
+
+An error is raised if none of the fits converges. That includes a population-level
+parameter that neither the data nor its prior determines, and effects without a
+conditional mode. Fits that do not converge are left out. Converged fits that end at
+different points produce a warning, and the one with the highest marginal density is
+used. Enable 64-bit floats in JAX before calling.
+
 ## What you provide, and what the package leaves out
 
 - **Step size and mass matrix.** Every chain has a fixed step size and a fixed diagonal
@@ -231,6 +303,8 @@ the pooled mean along the long axis of the Gaussian.
   by `warmup`. The benchmark uses `blackjax.window_adaptation` for its common start.
 - **Positions are vectors.** Flatten a structured position yourself, for example with
   `jax.flatten_util.ravel_pytree`.
+- **Starting positions.** Supply them in `Jobs`. For a hierarchical model with one
+  grouping factor, `hierarchical_start` computes them together with an inverse mass.
 - **Keys.** Transition `t` of a chain uses the key `jax.random.fold_in(key, t)` exactly
   as `blackjax.nuts(...).step` would use it.
 - **Memory.** The device holds the state of the lanes and a buffer for finished
@@ -267,6 +341,26 @@ are fewer lanes than chains, so lanes take over new chains and new datasets on t
 `tests/test_refill.py` checks that the draws of a chain do not depend on the number of
 lanes or on the size of the buffer, and `tests/test_distribution.py` checks the moments
 of the draws on two normal targets.
+
+`tests/test_hierarchical.py` checks `hierarchical_start` on three simulated models.
+
+- **A normal posterior is drawn exactly.** The fitted values are within 1e-4 standard
+  errors of the exact ones, their covariance and the inverse mass equal the exact ones
+  to a relative 1e-6, and 4,000 starts whitened by the exact posterior have zero mean
+  and unit covariance within sampling error.
+- **The parametrization of the effects does not matter.** A model with one effect per
+  group and a group scale gives the same starts whether the effects are written
+  centered or scaled.
+- **A marginal that is not normal is followed.** With 8 groups the logarithm of the
+  group scale has a skewed marginal. Against that marginal computed exactly on a
+  grid, 4,000 starts have its mean to 0.1 standard deviations and its variance to
+  15%. Without the slice update the variance is below 0.7 of the exact one.
+- **Effects that enter nonlinearly.** On an exponential decay with two effects per
+  group, the fit is a stationary point of an independent Laplace objective, built with
+  a generic optimizer and a dense Hessian, and has its curvature to 2%.
+- **Failures are reported.** A marginal with two modes gives a warning that fits ended
+  at different points. A population-level parameter that nothing determines, and
+  effects whose stationary point at zero is not a mode, raise an error.
 
 ```
 pytest
