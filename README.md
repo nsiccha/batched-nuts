@@ -101,6 +101,14 @@ print(f"{useful:.0%} of the gradient evaluations advanced a chain")
 batched loop, each of which cost one gradient evaluation per lane, and `num_evaluations`
 counts the gradient evaluations that advanced a chain.
 
+When every chain uses the same observations, omit `Jobs.dataset` and pass the
+array or pytree directly. For example, `sample_batches(logdensity, jobs, data=obs)`
+calls `logdensity(position, obs)` with the original leaf shapes. The sampler passes
+one shared dataset into its compiled startup and sampling rounds. Changing values
+with the same shapes and dtypes can reuse those programs. The indexed form above
+also shares a single row when all jobs select it. These rules apply to `sample`,
+`warmup`, `sample_batches` and `lower_sample_batches`.
+
 A log density without data takes the position only: `sample(logdensity, jobs, num_draws)`.
 Without `num_lanes`, all chains run at once.
 

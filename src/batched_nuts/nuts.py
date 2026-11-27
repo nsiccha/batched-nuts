@@ -36,7 +36,7 @@ class Jobs(NamedTuple):
     position: Any  # (num_jobs, dim) initial positions
     step_size: Any  # (num_jobs,)
     inverse_mass: Any  # (num_jobs, dim) diagonal inverse mass, or MetricFactor
-    dataset: Any = None  # (num_jobs,) which slice of `data` the chain's density reads
+    dataset: Any = None  # row per chain in a data table; omit to share the entire input
 
 
 class Draws(NamedTuple):
@@ -350,6 +350,7 @@ def _loop(
     max_depth,
     state: State,
     chains: Chain,
+    shared_data,
     num_draws,
     chains_waiting,
     max_rounds=None,
@@ -372,7 +373,8 @@ def _loop(
         emit = ~jnp.asarray(first_draw) | (state.num_records == 0)
         return emit & budget & room & jnp.any(active) & ~(chains_waiting & jnp.any(~active))
 
-    iteration = partial(_iteration, logdensity, max_depth, chains, num_draws)
+    target = _bind_shared_data(logdensity, shared_data)
+    iteration = partial(_iteration, target, max_depth, chains, num_draws)
     return jax.lax.while_loop(go_on, iteration, state)
 
 
@@ -412,7 +414,8 @@ def _start_lanes(logdensity, lanes, chains, position):
     )
 
 
-def _refill(logdensity, state, chains, take, job, jobs, data):
+def _refill(logdensity, state, chains, take, job, jobs, data, shared_data):
+    logdensity = _bind_shared_data(logdensity, shared_data)
     lanes, chains = _assign(logdensity, state.lanes, chains, take, job, jobs, data)
     return state._replace(lanes=lanes), chains
 
@@ -492,6 +495,33 @@ def _empty(num_lanes, dim, dtype, max_depth, buffer_size, data, metric=None):
     return state, chains
 
 
+def _bind_shared_data(logdensity, shared_data):
+    # Called inside jit: shared_data is a runtime operand outside the per-lane vmap.
+    if shared_data is None:
+        return logdensity
+    return lambda position, _: logdensity(position, shared_data)
+
+
+def _prepare_data(data, queue, *, lower=False):
+    """Separate indexed tables for lane refill from one shared runtime argument."""
+    if data is None:
+        return None, None
+    indices = queue.dataset
+    if indices is not None:
+        if not (
+            indices.shape == (len(queue.position),)
+            and indices.size
+            and np.all(indices == indices[0])
+        ):
+            return data, None
+        row = int(indices[0])
+        # Leave out-of-bounds indexing to the existing device gather.
+        if not all(-x.shape[0] <= row < x.shape[0] for x in jax.tree.leaves(data)):
+            return data, None
+        data = jax.tree.map(lambda x: x[row], data)
+    return None, data if lower else jax.device_put(data)
+
+
 def _prepare_queue(logdensity, jobs, data):
     position = np.asarray(jobs.position)
     if not np.issubdtype(position.dtype, np.floating):
@@ -501,10 +531,8 @@ def _prepare_queue(logdensity, jobs, data):
     if data is None:
         logdensity = _without_data(logdensity)
         dataset = np.zeros(num_jobs, np.int32)
-    elif jobs.dataset is None:
-        raise ValueError("`jobs.dataset` must say which slice of `data` each chain reads.")
     else:
-        dataset = np.asarray(jobs.dataset, np.int32)
+        dataset = None if jobs.dataset is None else np.asarray(jobs.dataset, np.int32)
     # The queue stays in host memory; the device only ever sees the chains in the lanes.
     queue = Jobs(
         key=np.asarray(jax.random.key_data(jobs.key)),
@@ -554,8 +582,10 @@ def sample(
     num_draws
         Draws per chain.
     data
-        Arrays (or a pytree of arrays) with one slice per dataset along their first axis.
-        Chain `j` samples `logdensity(position, data[jobs.dataset[j]])`.
+        With no `jobs.dataset`, every chain samples `logdensity(position, data)`.
+        With one index per job, each array leaf has a leading dataset axis and
+        chain j reads its indexed row. If all indices agree, the row is shared.
+        Shared data is a runtime argument independent of the number of lanes.
     num_lanes
         How many chains run at the same time.  The default is all of them.  With fewer
         lanes than chains, a lane that has finished a chain takes the next one.
@@ -568,6 +598,7 @@ def sample(
         device.  The default is `max(1024, 4 * num_lanes)`.
     """
     logdensity, queue = _prepare_queue(logdensity, jobs, data)
+    data, shared_data = _prepare_data(data, queue)
     num_jobs, dim = queue.position.shape
     dtype = queue.position.dtype
     num_lanes = num_jobs if num_lanes is None else min(num_lanes, num_jobs)
@@ -603,8 +634,8 @@ def sample(
         assignment = _assignment(state.lanes.active, queue, next_job)
         if assignment is not None:
             take, job, rows, next_job = assignment
-            state, chains = refill(state, chains, take, job, rows, data)
-        state = loop(state, chains, jnp.int32(num_draws), next_job < num_jobs)
+            state, chains = refill(state, chains, take, job, rows, data, shared_data)
+        state = loop(state, chains, shared_data, jnp.int32(num_draws), next_job < num_jobs)
         num_iterations += int(state.num_iterations)
         num_evaluations += int(state.num_evaluations)
         done = not np.any(state.lanes.active)

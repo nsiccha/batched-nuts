@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from batched_nuts.nuts import _start_lanes
+from batched_nuts.nuts import _bind_shared_data, _start_lanes
 
 if TYPE_CHECKING:
     from batched_nuts.stream import DrawBatch
@@ -88,7 +88,7 @@ class _History(NamedTuple):
 
 
 @partial(jax.jit, static_argnums=0)
-def _grow(target, lanes, chains, stats, keys, parents, positions, key_words):
+def _grow(target, lanes, chains, stats, keys, parents, positions, key_words, shared_data):
     """Initialize new rows with frozen parent tuning, then concatenate the states."""
 
     def append(existing, extra):
@@ -101,7 +101,9 @@ def _grow(target, lanes, chains, stats, keys, parents, positions, key_words):
     seed = jax.random.wrap_key_data(key_words)
     new_keys = jax.vmap(partial(jax.random.fold_in, seed))(child_jobs)
     children = select(chains)._replace(job=child_jobs, key=new_keys)
-    starts = _start_lanes(target, select(lanes), children, positions)
+    starts = _start_lanes(
+        _bind_shared_data(target, shared_data), select(lanes), children, positions
+    )
     if stats is not None:
         # A source is frozen. Its terminal phase makes the mixed step advance the
         # child with its fitted tuning while other original chains are still warming.
@@ -237,10 +239,18 @@ class _Branches:
             points.append(point)
         return tuple(origins), np.stack(points) if points else None
 
-    def grow(self, state, chains, stats, keys, origins, points):
+    def grow(self, state, chains, stats, keys, origins, points, shared_data):
         parents = np.array([b.parent for b in origins], np.int32)
         lanes, chains, stats, keys = _grow(
-            self.target, state.lanes, chains, stats, keys, parents, points, self.key_words
+            self.target,
+            state.lanes,
+            chains,
+            stats,
+            keys,
+            parents,
+            points,
+            self.key_words,
+            shared_data,
         )
         self.width += len(origins)
         self.settling = np.r_[self.settling, [b.settle for b in origins]]

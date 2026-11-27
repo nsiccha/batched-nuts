@@ -13,10 +13,12 @@ from batched_nuts.branching import Branching, BranchOrigin, _Branches, _History
 from batched_nuts.nuts import (
     Jobs,
     Record,
+    _bind_shared_data,
     _broadcast_data,
     _chain_data,
     _compiled,
     _empty,
+    _prepare_data,
     _prepare_queue,
     _write_records,
 )
@@ -99,13 +101,24 @@ def _mixed_loop(
     save_history=False,
     stop_at_freeze=False,
 ):
-    def run(state, chains, stats, keys, budgets, target_accept, limit, first, history=None):
+    def run(
+        state,
+        chains,
+        shared_data,
+        stats,
+        keys,
+        budgets,
+        target_accept,
+        limit,
+        first,
+        history=None,
+    ):
         state = state._replace(num_iterations=jnp.int32(0))
         if not observe:
             state = state._replace(num_records=jnp.int32(0))
         step = partial(
             _warm_step,
-            target,
+            _bind_shared_data(target, shared_data),
             max_depth,
             policy,
             schedule,
@@ -186,7 +199,7 @@ def _mixed_loop(
         result = (*carry[:4], go_on(carry)) if observe else carry[:3]
         return (*result, carry[4]) if save_history else result
 
-    return jax.jit(run, donate_argnums=(0, 1, 2, 8) if save_history else (0, 1, 2))
+    return jax.jit(run, donate_argnames=("state", "chains", "stats", "history"))
 
 
 def _host_record(column, count):
@@ -306,6 +319,10 @@ def sample_batches(
     to also receive moments from completed adaptive diagonal metric windows.
     With branching, yield BranchBatch objects. Call branching.choose at eligible
     freeze, draw and checkpoint batches to admit children with frozen parent tuning.
+
+    Pass `data=observations` and omit `jobs.dataset` to share one runtime
+    dataset across all chains. With explicit indices, the density receives each
+    job's selected row of the data tree. Equal indices also share one row.
     """
     yield from _prepare_stream(
         logdensity,
@@ -443,14 +460,14 @@ def _prepare_stream(
         raise ValueError("The buffer must hold at least one simultaneous draw per chain.")
     if branching is not None and not isinstance(branching, Branching):
         raise TypeError("branching must be a Branching policy.")
-    branches = (
-        _Branches(branching, queue.dataset, buffer_size, target)
-        if branching is not None
-        else None
-    )
+    branches = None
+    if branching is not None:
+        datasets = np.zeros(width, np.int32) if queue.dataset is None else queue.dataset
+        branches = _Branches(branching, datasets, buffer_size, target)
     if max_rounds == 0:
         return None if lower else iter(())
 
+    data, shared_data = _prepare_data(data, queue, lower=lower)
     dtype = queue.position.dtype
 
     def buffers(data, metric):
@@ -479,12 +496,12 @@ def _prepare_stream(
     take, ids = np.ones(width, bool), np.arange(width, dtype=np.int32)
     refill, loop = _compiled(target, max_depth)
     if schedule is None:
-        inputs = (state, chains, take, ids, queue, data)
+        inputs = (state, chains, take, ids, queue, data, shared_data)
     else:
         refill, _ = _compiled_warmup(
             target, max_depth, policy, schedule, acceptance, restart_dual
         )
-        inputs = (state.lanes, chains, stats, take, ids, queue, data)
+        inputs = (state.lanes, chains, stats, take, ids, queue, data, shared_data)
 
     if lower:
         traced = refill.trace(*inputs)
@@ -494,7 +511,7 @@ def _prepare_stream(
         placement = next(
             (
                 x.sharding
-                for x in jax.tree.leaves(data)
+                for x in jax.tree.leaves((data, shared_data))
                 if _committed_sharding(x) is not None
             ),
             None,
@@ -556,11 +573,13 @@ def _prepare_stream(
     if lower:
         limit = _round_limit(0, max_rounds, rounds_per_batch)
         return LoweredStream(
-            startup, step.lower(state, chains, *round_args, limit, True, *history_args)
+            startup,
+            step.lower(state, chains, shared_data, *round_args, limit, True, *history_args),
         )
     return _round_batches(
         state,
         chains,
+        shared_data,
         step,
         round_args,
         loop,
@@ -612,6 +631,7 @@ def _round_limit(rounds, max_rounds, rounds_per_batch):
 def _round_batches(
     state,
     chains,
+    shared_data,
     step,
     round_args,
     loop,
@@ -633,7 +653,7 @@ def _round_batches(
         freeze_checkpoint = False
         new_failures = np.empty(0, dtype=np.intp)
         limit = _round_limit(rounds, max_rounds, rounds_per_batch)
-        result = step(state, chains, *round_args, limit, first, *history_args)
+        result = step(state, chains, shared_data, *round_args, limit, first, *history_args)
         if step is loop:
             state = result
             del result
@@ -692,7 +712,7 @@ def _round_batches(
                     if origins:
                         stats, keys = round_args[:2] if step is not loop else (None, None)
                         state, chains, stats, keys = branches.grow(
-                            state, chains, stats, keys, origins, points
+                            state, chains, stats, keys, origins, points, shared_data
                         )
                         if step is not loop:
                             round_args = (stats, keys, *round_args[2:])

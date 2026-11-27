@@ -17,7 +17,9 @@ from batched_nuts.nuts import (
     _begin_doubling,
     _begin_next,
     _begin_transition,
+    _bind_shared_data,
     _empty_lanes,
+    _prepare_data,
     _prepare_queue,
     _where,
 )
@@ -479,10 +481,11 @@ def _warm_step(
 def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restart_dual):
     n_windows = len(schedule.lengths())
 
-    def refill(lanes, chains, stats, take, job, rows, data):
+    def refill(lanes, chains, stats, take, job, rows, data, shared_data):
         keys = jax.vmap(jax.random.split)(jax.random.wrap_key_data(rows.key))
         rows = rows._replace(key=jax.random.key_data(keys[:, 0]))
-        lanes, chains = _assign(logdensity, lanes, chains, take, job, rows, data)
+        target = _bind_shared_data(logdensity, shared_data)
+        lanes, chains = _assign(target, lanes, chains, take, job, rows, data)
         if isinstance(policy, DiagonalAdaptation) and policy.initial == "gradient":
             grad = jnp.abs(lanes.proposal.grad)
             limits = jnp.finfo(grad.dtype)
@@ -519,12 +522,12 @@ def _compiled_warmup(logdensity, max_depth, policy, schedule, acceptance, restar
             valid,
         )
 
-    def run(lanes, stats, chains, budgets, target, waiting):
+    def run(lanes, stats, chains, shared_data, budgets, target, waiting):
         active_at_start = lanes.active
         advance = jax.vmap(
             partial(
                 _warm_step,
-                logdensity,
+                _bind_shared_data(logdensity, shared_data),
                 max_depth,
                 policy,
                 schedule,
@@ -677,6 +680,8 @@ def warmup(
     metric-window boundaries. Sampling receives frozen parameters and independent keys.
     Per-window counts exclude initialization. Adaptive schedules leave unused metric
     windows at zero and store final calibration counts in the last column.
+    As in `sample`, pass one shared dataset directly as `data`, or select rows
+    from a table with `jobs.dataset`. The frozen jobs retain this choice.
     """
     logdensity, queue, width, budgets, policy, schedule, max_depth = _prepare_warmup(
         logdensity,
@@ -692,6 +697,7 @@ def warmup(
         max_depth,
         structured,
     )
+    data, shared_data = _prepare_data(data, queue)
     n_jobs, dim = queue.position.shape
     dtype = queue.position.dtype
     n_windows = len(budgets)
@@ -722,7 +728,7 @@ def warmup(
         if assignment is not None:
             take, ids, rows, next_job = assignment
             lanes, chains, stats, sample_keys, valid = refill(
-                lanes, chains, stats, take, ids, rows, data
+                lanes, chains, stats, take, ids, rows, data, shared_data
             )
             bad = ids[take & ~np.asarray(valid)]
             if len(bad):
@@ -736,6 +742,7 @@ def warmup(
             lanes,
             stats,
             chains,
+            shared_data,
             jnp.asarray(budgets, jnp.int32),
             jnp.asarray(target_acceptance, dtype),
             next_job < n_jobs,

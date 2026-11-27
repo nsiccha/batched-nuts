@@ -367,6 +367,8 @@ def test_summary_and_evidence_availability_for_other_warmup_policies(structured)
         ("diagonal", np.float64, None),
         ("structured", np.float64, 8),
         ("auto_mesh", np.float32, 8),
+        ("shared", np.float64, 8),
+        ("shared_auto_mesh", np.float32, 8),
         ("events", np.float64, 7),
         ("branching", np.float64, 8),
     ],
@@ -405,8 +407,8 @@ def test_lower_sample_batches_matches_stream_calls(monkeypatch, mode, dtype, cap
         options["branching"] = Branching(
             jax.random.key(8), 1, 5, premature_branch, warmup_history=3
         )
-    if mode in ("structured", "auto_mesh"):
-        automatic = mode == "auto_mesh"
+    if mode in ("structured", "auto_mesh", "shared_auto_mesh"):
+        automatic = mode in ("auto_mesh", "shared_auto_mesh")
         axis = jax.sharding.AxisType.Auto if automatic else jax.sharding.AxisType.Explicit
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:2]), ("batch",), (axis,))
         spec = (
@@ -425,7 +427,7 @@ def test_lower_sample_batches_matches_stream_calls(monkeypatch, mode, dtype, cap
         position,
         np.full(2, 0.2, dtype),
         metric,
-        dataset=np.array([2, 0]),
+        dataset=np.array([2, 2]) if mode.startswith("shared") else np.array([2, 0]),
     )
 
     calls = {}

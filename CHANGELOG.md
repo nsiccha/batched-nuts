@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.10
+
+Sampling and warmup accept a single runtime dataset in `data` when
+`Jobs.dataset` is omitted. Indexed calls also share one row when every job
+selects it. The observation buffer for these calls stays the same size as
+the number of active chains grows, including when a stream branches.
+
 ## 0.1.9
 
 `hierarchical_start` accepts two ordered `GroupFactor` declarations with a
